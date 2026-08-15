@@ -197,6 +197,7 @@ with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=Fa
     temp_file.write("\n")
     temporary_path = temp_file.name
 os.chown(temporary_path, int(uid), int(gid))
+os.chmod(temporary_path, 0o644)
 os.replace(temporary_path, settings_path)
 PYTHON
 
