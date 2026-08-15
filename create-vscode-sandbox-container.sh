@@ -68,7 +68,7 @@ fi
 
 [[ "$engine" == docker || "$engine" == podman ]] || die '--engine must be docker or podman'
 command -v "$engine" >/dev/null 2>&1 || die "$engine is not available"
-"$engine" info >/dev/null || die "$engine is not usable by the current user"
+"$engine" info >/dev/null 2>&1 || die "$engine is not usable by the current user"
 
 case "$engine" in
   podman)
