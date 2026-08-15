@@ -148,8 +148,7 @@ if ! "$engine" exec --user 0 "$container" /bin/sh -ec 'command -v python3 >/dev/
     'export DEBIAN_FRONTEND=noninteractive; apt-get install -y python3'
 fi
 
-"$engine" exec --user 0 "$container" install -d -m 0700 -o "$uid" -g "$gid" \
-  "$home/.vscode-server/data/Machine"
+"$engine" exec --user "$user" "$container" mkdir -p "$home/.vscode-server/data/Machine"
 
 cat <<'PYTHON' | "$engine" exec -i --user 0 "$container" python3 - "$home/.vscode-server/data/Machine/settings.json" "$uid" "$gid"
 import json
