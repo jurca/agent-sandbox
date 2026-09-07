@@ -4,10 +4,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: create-vscode-sandbox-container.sh [--engine docker|podman] [--allow-rootful] IMAGE CONTAINER USER
+Usage: create-agent-sandbox-container.sh [--engine docker|podman] [--allow-rootful] IMAGE CONTAINER USER
 
 Creates a rootless Docker or Podman workspace container configured for the
-VS Code agent terminal sandbox.
+VS Code and Claude Code agent terminal sandboxes.
 EOF
 }
 
@@ -150,7 +150,7 @@ fi
 
 "$engine" exec --user "$user" "$container" mkdir -p "$home/.vscode-server/data/Machine" "$home/.claude"
 
-cat configure_ai_harnesses.py | "$engine" exec -i --user 0 "$container" python3 - "$home/.vscode-server/data/Machine/settings.json" "$home/.claude/settings.json" "$uid" "$gid"
+cat configure_agent_harnesses.py | "$engine" exec -i --user 0 "$container" python3 - "$home/.vscode-server/data/Machine/settings.json" "$home/.claude/settings.json" "$uid" "$gid"
 
 "$engine" cp "$socket_script" "$container:/usr/bin/list-unix-sockets"
 "$engine" exec --user 0 "$container" chmod 0755 /usr/bin/list-unix-sockets
