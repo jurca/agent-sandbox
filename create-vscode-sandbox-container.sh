@@ -148,9 +148,9 @@ if ! "$engine" exec --user 0 "$container" /bin/sh -ec 'command -v python3 >/dev/
     'export DEBIAN_FRONTEND=noninteractive; apt-get install -y python3'
 fi
 
-"$engine" exec --user "$user" "$container" mkdir -p "$home/.vscode-server/data/Machine"
+"$engine" exec --user "$user" "$container" mkdir -p "$home/.vscode-server/data/Machine" "$home/.claude"
 
-cat configure_ai_harnesses.py | "$engine" exec -i --user 0 "$container" python3 - "$home/.vscode-server/data/Machine/settings.json" "$uid" "$gid"
+cat configure_ai_harnesses.py | "$engine" exec -i --user 0 "$container" python3 - "$home/.vscode-server/data/Machine/settings.json" "$home/.claude/settings.json" "$uid" "$gid"
 
 "$engine" cp "$socket_script" "$container:/usr/bin/list-unix-sockets"
 "$engine" exec --user 0 "$container" chmod 0755 /usr/bin/list-unix-sockets
