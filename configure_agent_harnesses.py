@@ -31,6 +31,7 @@ def configure_github_copilot_sandbox(settings_path: str, uid: int, gid: int) -> 
         raise SystemExit(f"{settings_path} must contain a JSON object")
 
     settings["chat.agent.sandbox.enabled"] = "on"
+    settings["chat.agent.sandbox.allowNetwork"] = False
 
     runtime = settings.get("chat.agent.sandbox.advanced.runtime", {})
     if not isinstance(runtime, dict):
