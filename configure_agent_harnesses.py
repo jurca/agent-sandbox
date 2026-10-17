@@ -56,6 +56,33 @@ def configure_github_copilot_sandbox(settings_path: str, uid: int, gid: int) -> 
         filesystem[key] = entries
     settings["chat.agent.sandbox.fileSystem.linux"] = filesystem
 
+    # Configure the new Copilot harness sandbox
+    settings["chat.agent.sandbox.network.allowNetwork"] = False
+    paths = settings.get("chat.agent.sandbox.fileSystem.userConfiguredPaths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+    denied_paths = paths.get("deniedPaths", [])
+    if not isinstance(denied_paths, list):
+        denied_paths = []
+    if "/tmp" not in denied_paths:
+        denied_paths.append("/tmp")
+    paths["deniedPaths"] = denied_paths
+    readonly_paths = paths.get("readonlyPaths", [])
+    if not isinstance(readonly_paths, list):
+        readonly_paths = []
+    if "~/.local/bin" not in readonly_paths:
+        readonly_paths.append("~/.local/bin")
+    if "~/.local/share/uv/python" not in readonly_paths:
+        readonly_paths.append("~/.local/share/uv/python")
+    paths["readonlyPaths"] = readonly_paths
+    readwrite_paths = paths.get("readwritePaths", [])
+    if not isinstance(readwrite_paths, list):
+        readwrite_paths = []
+    if "~/.cache/uv" not in readwrite_paths:
+        readwrite_paths.append("~/.cache/uv")
+    paths["readwritePaths"] = readwrite_paths
+    settings["chat.agent.sandbox.fileSystem.userConfiguredPaths"] = paths
+
     _atomically_write_json_file(settings_path, settings, indent="\t", uid=uid, gid=gid)
 
 

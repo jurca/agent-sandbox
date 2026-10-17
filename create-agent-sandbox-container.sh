@@ -129,6 +129,8 @@ printf 'Creating %s container %q as %s (UID %s, home %s).\n' "$engine" "$contain
   --name "$container" \
   --user "$user" \
   --restart unless-stopped \
+  --device /dev/net/tun \
+  --security-opt systempaths=unconfined \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
   --entrypoint sleep \
@@ -141,7 +143,7 @@ cleanup_on_error() {
 trap cleanup_on_error ERR
 
 "$engine" exec --user 0 "$container" /bin/sh -ec \
-  'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y bubblewrap socat'
+  'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y bubblewrap socat slirp4netns iptables'
 
 if ! "$engine" exec --user 0 "$container" /bin/sh -ec 'command -v python3 >/dev/null'; then
   "$engine" exec --user 0 "$container" /bin/sh -ec \
