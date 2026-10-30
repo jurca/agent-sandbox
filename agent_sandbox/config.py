@@ -1,0 +1,247 @@
+"""Project (`.agent-sandbox/config.toml`) and user-level configuration."""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .util import SandboxError, config_dir
+
+PROJECT_DIR = ".agent-sandbox"
+CONFIG_FILE = "config.toml"
+PROXY_CONF_FILE = "tinyproxy.conf"
+ALLOW_BASE_FILE = "allow.base"
+ALLOW_EXTRA_FILE = "allow.extra"
+APPROVED_FILES = (CONFIG_FILE, PROXY_CONF_FILE, ALLOW_BASE_FILE, ALLOW_EXTRA_FILE)
+
+WORKSPACE_TARGET = "/workspace"
+DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
+DEFAULT_STATE_PATHS = (".claude", ".copilot")
+DEFAULT_PROXY_BASE_IMAGE = "alpine:3"
+
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+_VOLUME_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]*$")
+
+
+@dataclass(frozen=True)
+class MountSpec:
+    """An extra read-only bind mount."""
+
+    source: str
+    target: str
+
+
+@dataclass
+class ProjectConfig:
+    image: str
+    harness: str = "bash"
+    env_pass: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_PASS))
+    env_set: dict[str, str] = field(default_factory=dict)
+    mounts: list[MountSpec] = field(default_factory=list)
+    state_paths: list[str] = field(default_factory=lambda: list(DEFAULT_STATE_PATHS))
+    proxy_base_image: str | None = None
+
+
+@dataclass
+class UserConfig:
+    engine: str = "auto"
+    docker_context: str | None = None
+    allow_rootful: bool = False
+    git: str = "ro"
+    state_volume: str = "per-workspace"
+    workspaces: dict[str, dict[str, str]] = field(default_factory=dict)
+    proxy_base_image: str | None = None
+
+    def git_mode(self, workspace: Path) -> str:
+        return self.workspaces.get(str(workspace), {}).get("git", self.git)
+
+    def state_scope(self, workspace: Path) -> str:
+        return self.workspaces.get(str(workspace), {}).get("state_volume", self.state_volume)
+
+
+def _table(data: dict[str, Any], key: str, where: str) -> dict[str, Any]:
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        raise SandboxError(f"{where}: [{key}] must be a table.")
+    return value
+
+
+def _only(table: dict[str, Any], allowed: set[str], where: str) -> None:
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise SandboxError(
+            f"{where}: unknown key(s) {', '.join(unknown)}. "
+            f"Allowed here: {', '.join(sorted(allowed))}."
+        )
+
+
+def _string_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SandboxError(f"{where} must be a list of strings.")
+    return list(value)
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        raise
+    except tomllib.TOMLDecodeError as exc:
+        raise SandboxError(f"{path}: invalid TOML: {exc}") from exc
+
+
+def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> ProjectConfig:
+    _only(data, {"image", "harness", "env", "mounts", "state", "proxy"}, where)
+    image = data.get("image")
+    if not isinstance(image, str) or not image.strip():
+        raise SandboxError(
+            f"{where}: `image` is required. Run `agent-sandbox init --image IMAGE` or set it."
+        )
+    harness = data.get("harness", "bash")
+    if not isinstance(harness, str) or not harness.strip():
+        raise SandboxError(f"{where}: `harness` must be a non-empty command line.")
+
+    env = _table(data, "env", where)
+    _only(env, {"pass", "set"}, f"{where} [env]")
+    env_pass = (
+        _string_list(env["pass"], f"{where} [env] pass")
+        if "pass" in env
+        else list(DEFAULT_ENV_PASS)
+    )
+    env_set_raw = env.get("set", {})
+    if not isinstance(env_set_raw, dict) or not all(
+        isinstance(v, str) for v in env_set_raw.values()
+    ):
+        raise SandboxError(f"{where}: [env.set] must map variable names to strings.")
+    for name in [*env_pass, *env_set_raw]:
+        if not _ENV_NAME.match(name):
+            raise SandboxError(f"{where}: invalid environment variable name {name!r}.")
+
+    mounts: list[MountSpec] = []
+    raw_mounts = data.get("mounts", [])
+    if not isinstance(raw_mounts, list):
+        raise SandboxError(f"{where}: `mounts` must be an array of tables ([[mounts]]).")
+    for index, entry in enumerate(raw_mounts, start=1):
+        if not isinstance(entry, dict):
+            raise SandboxError(f"{where}: mounts entry {index} must be a table.")
+        _only(entry, {"source", "target"}, f"{where} [[mounts]] #{index}")
+        source, target = entry.get("source"), entry.get("target", entry.get("source"))
+        if not isinstance(source, str) or not isinstance(target, str):
+            raise SandboxError(f"{where}: mounts entry {index} needs string `source` and `target`.")
+        if not source.startswith("/") or not target.startswith("/"):
+            raise SandboxError(f"{where}: mounts entry {index}: paths must be absolute.")
+        mounts.append(MountSpec(source.rstrip("/") or "/", target.rstrip("/") or "/"))
+
+    state = _table(data, "state", where)
+    _only(state, {"paths"}, f"{where} [state]")
+    state_paths = (
+        _string_list(state["paths"], f"{where} [state] paths")
+        if "paths" in state
+        else list(DEFAULT_STATE_PATHS)
+    )
+    for rel in state_paths:
+        parts = Path(rel).parts
+        if not rel or rel.startswith("/") or ".." in parts or rel in (".", "~"):
+            raise SandboxError(
+                f"{where}: state path {rel!r} must be relative to the home directory."
+            )
+
+    proxy = _table(data, "proxy", where)
+    _only(proxy, {"base_image"}, f"{where} [proxy]")
+    base = proxy.get("base_image")
+    if base is not None and (not isinstance(base, str) or not base.strip()):
+        raise SandboxError(f"{where}: [proxy] base_image must be a non-empty string.")
+
+    return ProjectConfig(
+        image=image.strip(),
+        harness=harness.strip(),
+        env_pass=env_pass,
+        env_set=dict(env_set_raw),
+        mounts=mounts,
+        state_paths=state_paths,
+        proxy_base_image=base,
+    )
+
+
+def load_project_config(workspace: Path) -> ProjectConfig:
+    path = workspace / PROJECT_DIR / CONFIG_FILE
+    try:
+        data = _load_toml(path)
+    except FileNotFoundError:
+        raise SandboxError(
+            f"No {PROJECT_DIR}/{CONFIG_FILE} in {workspace}.\n"
+            "Create it with: agent-sandbox init --image IMAGE"
+        ) from None
+    return parse_project_config(data, f"{PROJECT_DIR}/{CONFIG_FILE}")
+
+
+def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserConfig:
+    _only(
+        data,
+        {"engine", "docker_context", "allow_rootful", "git", "state_volume", "workspaces", "proxy"},
+        where,
+    )
+    config = UserConfig()
+    if "engine" in data:
+        if data["engine"] not in ("auto", "docker", "podman"):
+            raise SandboxError(f"{where}: engine must be auto, docker or podman.")
+        config.engine = data["engine"]
+    if "docker_context" in data:
+        if not isinstance(data["docker_context"], str):
+            raise SandboxError(f"{where}: docker_context must be a string.")
+        config.docker_context = data["docker_context"] or None
+    if "allow_rootful" in data:
+        if not isinstance(data["allow_rootful"], bool):
+            raise SandboxError(f"{where}: allow_rootful must be true or false.")
+        config.allow_rootful = data["allow_rootful"]
+    if "git" in data:
+        config.git = _git_mode(data["git"], where)
+    if "state_volume" in data:
+        config.state_volume = _state_scope(data["state_volume"], where)
+    for path, table in _table(data, "workspaces", where).items():
+        if not isinstance(table, dict):
+            raise SandboxError(f'{where}: [workspaces."{path}"] must be a table.')
+        _only(table, {"git", "state_volume"}, f'{where} [workspaces."{path}"]')
+        override: dict[str, str] = {}
+        if "git" in table:
+            override["git"] = _git_mode(table["git"], where)
+        if "state_volume" in table:
+            override["state_volume"] = _state_scope(table["state_volume"], where)
+        config.workspaces[path] = override
+    proxy = _table(data, "proxy", where)
+    _only(proxy, {"base_image"}, f"{where} [proxy]")
+    if isinstance(proxy.get("base_image"), str):
+        config.proxy_base_image = proxy["base_image"]
+    return config
+
+
+def _git_mode(value: Any, where: str) -> str:
+    if value not in ("ro", "rw"):
+        raise SandboxError(f'{where}: git must be "ro" or "rw".')
+    return value
+
+
+def _state_scope(value: Any, where: str) -> str:
+    if value != "per-workspace" and not (isinstance(value, str) and _VOLUME_NAME.match(value)):
+        raise SandboxError(
+            f'{where}: state_volume must be "per-workspace" or a volume name '
+            "(lowercase letters, digits, `_`, `.`, `-`)."
+        )
+    return value
+
+
+def user_config_path() -> Path:
+    return config_dir() / "config.toml"
+
+
+def load_user_config() -> UserConfig:
+    path = user_config_path()
+    try:
+        data = _load_toml(path)
+    except FileNotFoundError:
+        return UserConfig()
+    return parse_user_config(data, str(path))

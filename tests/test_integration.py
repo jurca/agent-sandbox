@@ -1,0 +1,704 @@
+"""End-to-end tests against a real engine (`pytest --integration`).
+
+They need rootless docker (or another engine the CLI accepts), `setfacl`, and outbound HTTPS to
+example.com. Everything lives in /tmp/asb-it-* with isolated AGENT_SANDBOX_*_DIR; finalizers run
+`rm --state`. Images are never pulled: ASB_TEST_IMAGE (default: a local devcontainer image whose
+uid 1000 user exists) must be present, and the derived-image test uses the locally built
+tinyproxy image as its Alpine base.
+"""
+
+from __future__ import annotations
+
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from agent_sandbox.config import DEFAULT_PROXY_BASE_IMAGE
+from agent_sandbox.images import derived_tag, proxy_image_tag
+from agent_sandbox.project import make_id
+
+from .conftest import git, make_repo
+
+pytestmark = pytest.mark.integration
+
+LAUNCHER = str(Path(__file__).resolve().parent.parent / "agent-sandbox")
+IMAGE = os.environ.get("ASB_TEST_IMAGE", "mcr.microsoft.com/vscode/devcontainers/python:3.14")
+ENGINE = os.environ.get("ASB_TEST_ENGINE", "docker")
+
+PROBE = r"""
+connect() {
+  exec 3<>/dev/tcp/proxy/8888 || { echo "$1 noproxy"; return; }
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+  line=""; read -r -t 15 line <&3; line=${line%$'\r'}
+  echo "$1 ${line:-timeout}"
+  exec 3>&-
+}
+get() {
+  exec 3<>/dev/tcp/proxy/8888 || { echo "$1 noproxy"; return; }
+  printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$1" "${1#http://}" >&3
+  line=""; read -r -t 15 line <&3; line=${line%$'\r'}
+  echo "$1 ${line:-timeout}"
+  exec 3>&-
+}
+for target; do case $target in http://*) get "$target" ;; *) connect "$target" ;; esac; done
+"""
+
+
+@dataclass
+class Env:
+    base: Path
+    vars: dict[str, str]
+
+    @property
+    def user_config(self) -> Path:
+        return self.base / "config" / "config.toml"
+
+    def runtime(self, root: Path) -> Path:
+        return self.base / "run" / make_id(root)
+
+
+@dataclass
+class Result:
+    code: int
+    out: str
+    err: str
+
+    @property
+    def text(self) -> str:
+        return self.out + self.err
+
+
+def engine(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([ENGINE, *args], capture_output=True, text=True, check=check)
+
+
+def has_image(ref: str) -> bool:
+    return engine("image", "inspect", ref).returncode == 0
+
+
+@pytest.fixture(scope="session")
+def env() -> Iterator[Env]:
+    if shutil.which(ENGINE) is None or engine("info").returncode != 0:
+        pytest.skip(f"{ENGINE} is not usable")
+    if not has_image(IMAGE):
+        pytest.skip(f"{IMAGE} is not present locally (set ASB_TEST_IMAGE)")
+    base = Path(tempfile.mkdtemp(prefix="asb-it-", dir="/tmp"))
+    variables = {
+        **os.environ,
+        "AGENT_SANDBOX_CONFIG_DIR": str(base / "config"),
+        "AGENT_SANDBOX_STATE_DIR": str(base / "state"),
+        "AGENT_SANDBOX_RUNTIME_DIR": str(base / "run"),
+        "TERM": "dumb",
+    }
+    (base / "config").mkdir()
+    yield Env(base, variables)
+    shutil.rmtree(base, ignore_errors=True)
+
+
+def asb(env: Env, cwd: Path, *args: str, stdin: str = "", timeout: float = 300) -> Result:
+    proc = subprocess.run(
+        [LAUNCHER, *args],
+        cwd=cwd,
+        env=env.vars,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    return Result(proc.returncode, proc.stdout, proc.stderr)
+
+
+def ok(env: Env, cwd: Path, *args: str, stdin: str = "") -> Result:
+    result = asb(env, cwd, *args, stdin=stdin)
+    assert result.code == 0, f"{args} failed ({result.code}):\n{result.text}"
+    return result
+
+
+def sh(env: Env, cwd: Path, script: str, *args: str) -> str:
+    return ok(env, cwd, "exec", "--", "sh", "-c", script, "sh", *args).out
+
+
+def probe(env: Env, cwd: Path, *targets: str) -> dict[str, str]:
+    out = ok(env, cwd, "exec", "--", "bash", "-c", PROBE, "probe", *targets).out
+    statuses = {}
+    for line in out.splitlines():
+        target, _, status = line.partition(" ")
+        match = re.match(r"HTTP/1\.[01] (\d+)", status)
+        statuses[target] = match.group(1) if match else status
+    return statuses
+
+
+Responder = Callable[[str], str | None]
+
+
+@dataclass
+class PtyRun:
+    """Runs the CLI on a pseudo-terminal; `respond` sees new output and may type a reply."""
+
+    env: Env
+    cwd: Path
+    args: tuple[str, ...]
+    respond: Responder = lambda _text: None
+    output: str = ""
+    code: int | None = None
+    _thread: threading.Thread | None = field(default=None, repr=False)
+    _pid: int = 0
+
+    def start(self) -> PtyRun:
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - child
+            os.chdir(self.cwd)
+            os.execve(LAUNCHER, [LAUNCHER, *self.args], self.env.vars)
+        self._pid = pid
+        self._thread = threading.Thread(target=self._pump, args=(fd,), daemon=True)
+        self._thread.start()
+        return self
+
+    def _pump(self, fd: int) -> None:
+        unanswered = ""
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096).decode("utf-8", "replace")
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.output += chunk
+                unanswered += chunk
+                reply = self.respond(unanswered)
+                if reply is not None:
+                    os.write(fd, (reply + "\n").encode())
+                    unanswered = ""
+        _, status = os.waitpid(self._pid, 0)
+        self.code = os.waitstatus_to_exitcode(status)
+        os.close(fd)
+
+    def wait(self, timeout: float = 120) -> PtyRun:
+        assert self._thread is not None
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            os.kill(self._pid, signal.SIGKILL)
+            self._thread.join(5)
+            pytest.fail(f"{self.args} did not finish:\n{self.output}")
+        return self
+
+
+def answer(*pairs: tuple[str, str]) -> Responder:
+    """Reply to each prompt pattern in turn."""
+    pending = list(pairs)
+
+    def respond(text: str) -> str | None:
+        if pending and re.search(pending[0][0], text):
+            return pending.pop(0)[1]
+        return None
+
+    return respond
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float, what: str) -> None:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return
+        time.sleep(0.25)
+    pytest.fail(f"timed out waiting for {what}")
+
+
+def proxy_state(env: Env, root: Path) -> str:
+    result = engine("exec", f"agent-sandbox-{make_id(root)}-proxy", "cat", "/var/lib/asb/state")
+    return result.stdout.split(" ", 1)[0].strip() if result.returncode == 0 else ""
+
+
+def configure(root: Path, env: Env, image: str = IMAGE) -> None:
+    """`init` records the approval itself, so nothing is created yet."""
+    ok(env, root, "init", "--image", image, "--force")
+
+
+def approve(env: Env, root: Path) -> None:
+    run = PtyRun(env, root, ("exec", "--", "true"), answer((r"Approve this", "y"))).start()
+    assert run.wait().code == 0, run.output
+
+
+@pytest.fixture(scope="session")
+def workspace(env: Env) -> Iterator[Path]:
+    """One long-lived sandbox shared by the non-destructive tests."""
+    root = make_repo(env.base / "main")
+    configure(root, env)
+    yield root
+    asb(env, root, "rm", "--state")
+
+
+@pytest.fixture
+def scratch(env: Env, request: pytest.FixtureRequest) -> Iterator[Path]:
+    """A fresh repository whose sandbox is removed afterwards (if it still exists)."""
+    root = make_repo(env.base / f"ws-{request.node.name[:40]}")
+    configure(root, env)
+    yield root
+    if root.exists():
+        asb(env, root, "rm", "--state")
+    else:
+        asb(env, env.base, "rm", make_id(root), "--state")
+
+
+def removed_by_id(sandbox_id: str) -> None:
+    selector = f"label=agent-sandbox.id={sandbox_id}"
+    for args in (("ps", "-a"), ("network", "ls"), ("volume", "ls")):
+        listing = engine(*args, "--filter", selector, "--quiet").stdout.strip()
+        assert listing == "", f"{args[0]} left over: {listing}"
+
+
+# --- creation, exec, ownership ----------------------------------------------------------
+
+
+def test_exec_runs_as_host_user_with_sandbox_environment(env: Env, workspace: Path) -> None:
+    out = sh(
+        env,
+        workspace,
+        'id -u; id -g; pwd; umask; echo "$HTTPS_PROXY $AGENT_SANDBOX"; '
+        'echo "$CLAUDE_CONFIG_DIR"; git config --get safe.directory',
+    )
+    uid, gid, cwd, umask, proxy_line, claude_dir, safe = out.split("\n")[:7]
+    assert (uid, gid) == (str(os.getuid()), str(os.getgid()))
+    assert cwd == "/workspace"
+    current = os.umask(0)
+    os.umask(current)
+    assert umask == f"{current:04o}"
+    assert proxy_line == "http://proxy:8888 1"
+    assert claude_dir.endswith("/.claude")
+    assert safe == "*"
+
+
+def test_workspace_is_shared_and_git_and_config_are_read_only(env: Env, workspace: Path) -> None:
+    sh(
+        env,
+        workspace,
+        "echo from-sandbox > /workspace/made-inside && mkdir -p /workspace/d/e"
+        " && echo x > /workspace/d/e/f",
+    )
+    made = workspace / "made-inside"
+    assert made.read_text() == "from-sandbox\n"
+    made.write_text("host can write\n")  # default ACL gives the host user access back
+    (workspace / "d" / "e" / "f").unlink()
+    (workspace / "host-file").write_text("x")
+    assert (
+        sh(env, workspace, "cat /workspace/host-file; echo >> /workspace/host-file && echo w")
+        == "xw\n"
+    )
+    script = (
+        "for p in /workspace/.git/x /workspace/.git/hooks/pre-commit /workspace/.agent-sandbox/x;"
+        ' do if touch "$p" 2>/dev/null; then echo "writable $p"; fi; done;'
+        " git -C /workspace status --short >/dev/null && echo status-ok;"
+        " git -C /workspace commit -q --allow-empty -m x 2>/dev/null || echo commit-refused"
+    )
+    assert sh(env, workspace, script) == "status-ok\ncommit-refused\n"
+    for name in ("made-inside", "host-file", "d"):
+        target = workspace / name
+        shutil.rmtree(target) if target.is_dir() else target.unlink()
+
+
+def test_state_dirs_belong_to_the_user_and_survive_recreate(env: Env, scratch: Path) -> None:
+    out = sh(
+        env,
+        scratch,
+        'stat -c %u "$HOME/.claude" "$HOME/.copilot"; echo kept > "$HOME/.claude/marker"',
+    )
+    assert out.split() == [str(os.getuid())] * 2
+    ok(env, scratch, "recreate")
+    assert sh(env, scratch, 'cat "$HOME/.claude/marker"') == "kept\n"
+    ok(env, scratch, "rm")
+    assert sh(env, scratch, 'cat "$HOME/.claude/marker"') == "kept\n"
+    ok(env, scratch, "rm", "--state")
+    assert sh(env, scratch, 'cat "$HOME/.claude/marker" 2>/dev/null || echo gone') == "gone\n"
+
+
+def test_proxy_is_unprivileged_without_host_mounts(env: Env, workspace: Path) -> None:
+    name = f"agent-sandbox-{make_id(workspace)}-proxy"
+    info = engine(
+        "inspect",
+        "--format",
+        "{{json .Mounts}} {{.State.Pid}} {{json .HostConfig.CapAdd}}",
+        name,
+        check=True,
+    ).stdout.split()
+    mounts, pid, cap_add = info
+    assert mounts == "[]" and cap_add in ("[]", "null")
+    inside = engine("exec", name, "sh", "-c", "id -u; ls -ld /var/lib/asb").stdout.split("\n")
+    assert inside[0] == "65534" and inside[1].startswith("drwx------")
+    tinyproxy = engine("exec", name, "pidof", "asb-tinyproxy").stdout.split()
+    assert tinyproxy
+    host_uids = {Path(f"/proc/{pid}").stat().st_uid}
+    host_uids |= {
+        int(line.split()[1])
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines()
+        if line.startswith("Uid:")
+    }
+    assert os.getuid() not in host_uids and 0 not in host_uids, host_uids
+    # The upstream configuration never lands in the host runtime directory.
+    assert not list(env.runtime(workspace).glob("*.conf"))
+
+
+def test_status_and_doctor(env: Env, workspace: Path) -> None:
+    status = ok(env, workspace, "status").out
+    assert "approved" in status and "matches the configuration" in status
+    assert "network:    base tier" in status
+    doctor = ok(env, workspace, "doctor").out
+    assert "FAIL" not in doctor and "No problems found." in doctor
+
+
+def test_repair_restores_acls(env: Env, workspace: Path) -> None:
+    target = workspace / "acl-target"
+    target.write_text("x")
+    sh(env, workspace, "echo y >> /workspace/acl-target")
+    subprocess.run(["setfacl", "-b", str(target)], check=True)
+    target.chmod(0o644)
+    refused = sh(env, workspace, "echo z >> /workspace/acl-target 2>/dev/null || echo refused")
+    assert refused == "refused\n"
+    ok(env, workspace, "repair")
+    assert sh(env, workspace, "echo z >> /workspace/acl-target && echo ok") == "ok\n"
+    target.unlink()
+
+
+def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
+    config = workspace / ".agent-sandbox" / "config.toml"
+    original = config.read_text()
+    config.write_text(original.replace('harness = "bash"', 'harness = "no-such-harness --x"'))
+    try:
+        approve(env, workspace)
+        result = ok(env, workspace, stdin="echo shell-$((1+1))\n")
+        assert "'no-such-harness' was not found" in result.err
+        assert "shell-2" in result.out
+    finally:
+        config.write_text(original)
+        approve(env, workspace)
+    result = ok(env, workspace, "root", stdin="id -u\n")
+    assert "ROOT SHELL" in result.err and "Rootless engine" in result.err
+    assert result.out.strip() == "0"
+
+
+# --- network tiers ----------------------------------------------------------------------
+
+
+def test_base_tier_allows_only_the_base_list(env: Env, workspace: Path) -> None:
+    statuses = probe(
+        env, workspace, "api.anthropic.com:443", "example.com:443", "example.com:80", "10.1.2.3:443"
+    )
+    assert statuses == {
+        "api.anthropic.com:443": "200",
+        "example.com:443": "403",
+        "example.com:80": "403",
+        "10.1.2.3:443": "403",
+    }
+    direct = sh(
+        env,
+        workspace,
+        "timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null && echo open || echo closed",
+    )
+    assert direct == "closed\n"
+
+
+def test_net_session_opens_and_expires(env: Env, workspace: Path) -> None:
+    proc = subprocess.Popen(
+        [LAUNCHER, "net", "12s", "--allow", "example.com"],
+        cwd=workspace,
+        env=env.vars,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        wait_for(lambda: proxy_state(env, workspace) == "net", 15, "net tier")
+        statuses = probe(
+            env,
+            workspace,
+            "example.com:443",
+            "pypi.org:443",
+            "example.com:80",
+            "http://example.net/",
+        )
+        assert statuses == {
+            "example.com:443": "200",
+            "pypi.org:443": "403",
+            "example.com:80": "403",
+            "http://example.net/": "403",
+        }
+        assert ok(env, workspace, "status").out.count("net tier") == 1
+        output, _ = proc.communicate(timeout=30)
+    finally:
+        proc.kill()
+    assert proc.returncode == 0, output
+    assert "blocked: pypi.org" in output and "blocked: example.net" in output
+    assert "Network session expired." in output
+    assert re.search(r"\n\s+1\s+pypi\.org", output), output
+    assert proxy_state(env, workspace) == "base"
+    assert probe(env, workspace, "example.com:443") == {"example.com:443": "403"}
+
+
+def test_net_refuses_second_session_extends_and_stops(env: Env, workspace: Path) -> None:
+    proc = subprocess.Popen(
+        [LAUNCHER, "net", "60"],
+        cwd=workspace,
+        env=env.vars,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        wait_for(lambda: proxy_state(env, workspace) == "net", 15, "net tier")
+        second = asb(env, workspace, "net", "30")
+        assert second.code == 1 and "already active" in second.err
+        deadline = float((env.runtime(workspace) / "deadline").read_text())
+        extended = ok(env, workspace, "net", "1m", "--extend", "--allow", "example.org")
+        assert "Extended" in extended.err
+        assert float((env.runtime(workspace) / "deadline").read_text()) == deadline + 60
+        assert probe(env, workspace, "example.org:443") == {"example.org:443": "200"}
+        ok(env, workspace, "net", "--stop")
+        output, _ = proc.communicate(timeout=15)
+    finally:
+        proc.kill()
+    assert "back on the base allowlist" in output
+    assert proxy_state(env, workspace) == "base"
+    assert probe(env, workspace, "example.org:443") == {"example.org:443": "403"}
+
+
+def test_killed_net_session_still_ends_on_time(env: Env, workspace: Path) -> None:
+    proc = subprocess.Popen(
+        [LAUNCHER, "net", "6", "--allow", "example.com"],
+        cwd=workspace,
+        env=env.vars,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    wait_for(lambda: proxy_state(env, workspace) == "net", 15, "net tier")
+    proc.send_signal(signal.SIGKILL)
+    proc.wait()
+    assert proxy_state(env, workspace) == "net"
+    wait_for(lambda: proxy_state(env, workspace) == "base", 12, "deadline to pass")
+    assert probe(env, workspace, "example.com:443") == {"example.com:443": "403"}
+    # The stale session does not block the next one.
+    run = ok(env, workspace, "net", "2")
+    assert "expired" in run.err
+
+
+def test_allow_all_keeps_internal_closed_and_offers_promotion(env: Env, workspace: Path) -> None:
+    run = PtyRun(
+        env,
+        workspace,
+        ("net", "40", "--allow-all"),
+        answer((r"Allow ALL hosts", "y"), (r"Add them to .*\[y/N/s", "n")),
+    ).start()
+    try:
+        wait_for(lambda: proxy_state(env, workspace) == "net", 20, "net tier")
+        statuses = probe(
+            env,
+            workspace,
+            "example.com:443",
+            "api.anthropic.com:443",
+            "10.1.2.3:443",
+            "127.0.0.1:443",
+            "localhost:443",
+            "169.254.169.254:443",
+        )
+        assert statuses["example.com:443"] == "200"
+        assert statuses["api.anthropic.com:443"] == "200"
+        for internal in ("10.1.2.3:443", "127.0.0.1:443", "localhost:443", "169.254.169.254:443"):
+            assert statuses[internal] == "502", (internal, statuses)
+        wait_for(lambda: "blocked (internal): 10.1.2.3" in run.output, 10, "live log line")
+        ok(env, workspace, "net", "--stop")
+    finally:
+        run.wait(60)
+    assert run.code == 0, run.output
+    assert "WARNING: --allow-all" in run.output
+    assert "outside allowlists: example.com" in run.output
+    tail = run.output.split("Hosts accessed outside your allowlists:")[1]
+    assert "example.com" in tail and "10.1.2.3" not in tail and "api.anthropic.com" not in tail
+    assert "example.com" not in (workspace / ".agent-sandbox" / "allow.extra").read_text()
+    assert probe(env, workspace, "example.com:443") == {"example.com:443": "403"}
+
+
+def test_promotion_appends_to_allow_extra(env: Env, workspace: Path) -> None:
+    extra = workspace / ".agent-sandbox" / "allow.extra"
+    original = extra.read_text()
+    run = PtyRun(env, workspace, ("net", "15"), answer((r"\[y/N/s", "y"))).start()
+    try:
+        wait_for(lambda: proxy_state(env, workspace) == "net", 20, "net tier")
+        assert probe(env, workspace, "example.net:443") == {"example.net:443": "403"}
+        ok(env, workspace, "net", "--stop")
+        run.wait(60)
+        assert "example.net" in extra.read_text()
+        assert "approved" in ok(env, workspace, "status").out
+        assert "NOT approved" not in ok(env, workspace, "status").out
+    finally:
+        extra.write_text(original)
+        approve(env, workspace)
+
+
+# --- approval, drift, sockets -----------------------------------------------------------
+
+
+def test_changed_config_needs_approval(env: Env, workspace: Path) -> None:
+    extra = workspace / ".agent-sandbox" / "allow.extra"
+    original = extra.read_text()
+    extra.write_text(original + "evil.example\n")
+    try:
+        refused = asb(env, workspace, "exec", "--", "true")
+        assert refused.code == 1
+        assert "+evil.example" in refused.err and "Not approved" in refused.err
+        run = PtyRun(env, workspace, ("exec", "--", "true"), answer((r"Approve", "n"))).start()
+        assert run.wait().code == 1 and "not approved" in run.output
+    finally:
+        extra.write_text(original)
+    ok(env, workspace, "exec", "--", "true")
+
+
+def test_drift_requires_recreate(env: Env, scratch: Path) -> None:
+    ok(env, scratch, "exec", "--", "true")
+    env.user_config.write_text(f'[workspaces."{scratch}"]\ngit = "rw"\n')
+    try:
+        drift = asb(env, scratch, "exec", "--", "true")
+        assert drift.code == 1 and "changed: git, mounts" in drift.err
+        assert "DIFFERS" in ok(env, scratch, "status").out
+        ok(env, scratch, "recreate")
+        assert sh(env, scratch, "touch /workspace/.git/rw-test && echo rw") == "rw\n"
+    finally:
+        env.user_config.unlink()
+        (scratch / ".git" / "rw-test").unlink(missing_ok=True)
+    assert asb(env, scratch, "exec", "--", "true").code == 1
+    ok(env, scratch, "recreate")
+
+
+def test_sockets_in_workspace_block_creation(env: Env, scratch: Path) -> None:
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(scratch / "agent.sock"))
+    try:
+        refused = asb(env, scratch, "exec", "--", "true")
+        assert refused.code == 1 and "agent.sock" in refused.err
+        assert engine("inspect", f"agent-sandbox-{make_id(scratch)}").returncode != 0
+        unsafe = ("exec", "--unsafely-mount-dirs-with-sockets", "--", "true")
+        prompt = r"Type \"I understand"
+        wrong = PtyRun(env, scratch, unsafe, answer((prompt, "yes"))).start().wait()
+        assert wrong.code == 1 and "Not confirmed" in wrong.output
+        phrase = "I understand the risks"
+        right = PtyRun(env, scratch, unsafe, answer((prompt, phrase))).start().wait()
+        assert right.code == 0, right.output
+    finally:
+        sock.close()
+
+
+# --- other layouts and flows ------------------------------------------------------------
+
+
+def test_derived_image_on_alpine(env: Env, scratch: Path) -> None:
+    alpine = proxy_image_tag(DEFAULT_PROXY_BASE_IMAGE)  # built by the sandbox fixture
+    if not has_image(alpine):
+        pytest.skip("local tinyproxy image missing")
+    tag = derived_tag(os.environ.get("USER", "user"), alpine)
+    existed = has_image(tag)
+    configure(scratch, env, image=alpine)
+    try:
+        out = sh(
+            env,
+            scratch,
+            'id -un; echo "$HOME"; stat -c %u "$HOME"; '
+            "awk -F: -v u=$(id -u) '$3==u {print $7}' /etc/passwd",
+        )
+        name, home, owner, shell = out.split()
+        assert name == os.environ.get("USER") and home == f"/home/{name}"
+        assert owner == str(os.getuid()) and shell == "/bin/sh"
+        labels = engine("image", "inspect", "--format", "{{json .Config.Labels}}", tag).stdout
+        assert engine("image", "inspect", "--format", "{{.Id}}", alpine).stdout.strip() in labels
+    finally:
+        asb(env, scratch, "rm", "--state")
+        if not existed:
+            engine("image", "rm", tag)
+
+
+def test_linked_worktree_with_shared_state_volume(env: Env, workspace: Path) -> None:
+    tree = env.base / "tree"
+    git(workspace, "worktree", "add", "-q", str(tree))
+    tree = tree.resolve()
+    shared = "asb-it-shared"
+    volume = f"agent-sandbox-state-shared-{shared}-claude"
+    shared_volumes = [volume, f"agent-sandbox-state-shared-{shared}-copilot"]
+    env.user_config.write_text(f'[workspaces."{tree}"]\nstate_volume = "{shared}"\n')
+    try:
+        configure(tree, env)
+        common = workspace / ".git"
+        script = (
+            "git -C /workspace log --oneline | wc -l;"
+            f" touch {common}/x 2>/dev/null || echo common-ro; ls -d {common}/worktrees"
+        )
+        out = sh(env, tree, script)
+        assert out.split("\n")[:3] == ["1", "common-ro", f"{common}/worktrees"]
+        removed = ok(env, tree, "rm", "--state")
+        assert "Kept shared state volume" in removed.err
+        assert engine("volume", "inspect", volume).returncode == 0
+    finally:
+        asb(env, tree, "rm", "--state")
+        engine("volume", "rm", *shared_volumes)
+        env.user_config.unlink(missing_ok=True)
+        git(workspace, "worktree", "remove", "--force", str(tree))
+
+
+def test_clone_flow(env: Env, workspace: Path) -> None:
+    outside = env.base / "clones"
+    outside.mkdir(exist_ok=True)
+    # A clone that already carries .agent-sandbox/ must be approved first.
+    source = make_repo(env.base / "configured-src")
+    configure(source, env)
+    git(source, "add", ".agent-sandbox")
+    git(source, "commit", "-q", "-m", "sandbox config")
+    cloned = asb(env, outside, f"file://{source}/.git")
+    assert cloned.code == 1 and "Not approved" in cloned.err, cloned.text
+    assert (outside / "configured-src" / "README").exists()
+    # A plain repository is initialised with --image.
+    bare = make_repo(env.base / "plain-src")
+    target = outside / "fresh"
+    try:
+        result = ok(env, outside, "--image", IMAGE, str(bare), str(target), stdin="pwd\n")
+        assert "Created .agent-sandbox/" in result.err
+        assert result.out.strip() == "/workspace"
+    finally:
+        asb(env, target, "rm", "--state")
+
+
+def test_ls_rm_name_and_prune(env: Env, scratch: Path) -> None:
+    ok(env, scratch, "exec", "--", "true")
+    sandbox_id = make_id(scratch)
+    listing = ok(env, scratch, "ls").out
+    assert re.search(rf"{sandbox_id}\s+running", listing)
+    ok(env, scratch, "rm")
+    assert re.search(rf"{sandbox_id}\s+state only", ok(env, scratch, "ls").out)
+    ok(env, scratch, "exec", "--", "true")
+    removed = ok(env, env.base, "rm", sandbox_id)
+    assert "container" in removed.out and "volume" not in removed.out
+
+    ok(env, scratch, "exec", "--", "true")
+    shutil.rmtree(scratch)
+    assert "orphaned: the workspace directory no longer exists" in ok(env, env.base, "ls").out
+
+    def respond(text: str) -> str | None:
+        match = re.search(r"Remove sandbox (\S+)\? \[y/N\]", text)
+        if match:
+            return "y" if match.group(1) == sandbox_id else "n"
+        return None
+
+    run = PtyRun(env, env.base, ("prune",), respond).start().wait()
+    assert run.code == 0, run.output
+    assert f"removed volume agent-sandbox-state-{sandbox_id}-claude" in run.output
+    removed_by_id(sandbox_id)
