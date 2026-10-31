@@ -25,6 +25,8 @@ def test_minimal_project_config_gets_defaults() -> None:
     assert cfg.env_set == {}
     assert cfg.mounts == []
     assert cfg.state_paths == list(DEFAULT_STATE_PATHS)
+    assert cfg.protected == [".claude", ".agents", ".vscode", ".idea"]
+    assert cfg.isolated == [".venv", "node_modules"]
     assert cfg.proxy_base_image is None
 
 
@@ -36,9 +38,12 @@ def test_full_project_config() -> None:
             "env": {"pass": ["TERM"], "set": {"A": "{home}/x"}},
             "mounts": [{"source": "/data/", "target": "/mnt/data"}, {"source": "/opt"}],
             "state": {"paths": [".claude", ".config/foo"]},
+            "workspace": {"protected": [".claude/", "./.envrc"], "isolated": ["web/node_modules"]},
             "proxy": {"base_image": "mirror/alpine:3"},
         }
     )
+    assert cfg.protected == [".claude", ".envrc"]
+    assert cfg.isolated == ["web/node_modules"]
     assert cfg.harness == "claude --verbose"
     assert cfg.env_pass == ["TERM"]
     assert cfg.env_set == {"A": "{home}/x"}
@@ -65,6 +70,16 @@ def test_full_project_config() -> None:
         ({"image": "i", "mounts": [{"source": "/a", "mode": "rw"}]}, "unknown key"),
         ({"image": "i", "mounts": [{"target": "/a"}]}, "string `source`"),
         ({"image": "i", "mounts": [{"source": "rel"}]}, "absolute"),
+        ({"image": "i", "mounts": [{"source": "{home}/x"}]}, "source must be absolute"),
+        ({"image": "i", "mounts": [{"source": "/a", "target": "~x"}]}, "target must be"),
+        ({"image": "i", "workspace": {"protected": "x"}}, "list of strings"),
+        ({"image": "i", "workspace": {"isolated": ["/abs"]}}, "inside the workspace"),
+        ({"image": "i", "workspace": {"isolated": ["a/../.."]}}, "inside the workspace"),
+        ({"image": "i", "workspace": {"protected": ["."]}}, "inside the workspace"),
+        ({"image": "i", "workspace": {"protected": [".git/hooks"]}}, "already read-only"),
+        ({"image": "i", "workspace": {"isolated": [".agent-sandbox"]}}, "already read-only"),
+        ({"image": "i", "workspace": {"protected": ["a"], "isolated": ["a/b"]}}, "both"),
+        ({"image": "i", "workspace": {"hidden": []}}, "unknown key"),
         ({"image": "i", "mounts": [{"source": "/a", "target": "rel"}]}, "absolute"),
         ({"image": "i", "state": {"paths": ["/abs"]}}, "relative to the home"),
         ({"image": "i", "state": {"paths": ["../up"]}}, "relative to the home"),
@@ -85,7 +100,8 @@ def test_init_template_parses_and_escapes() -> None:
     cfg = parse_project_config(data)
     assert cfg.image == 'reg/img:"tag"\\x'
     assert cfg.env_set["CLAUDE_CONFIG_DIR"] == "{home}/.claude"
-    assert cfg.state_paths == [".claude", ".copilot"]
+    assert cfg.state_paths == list(DEFAULT_STATE_PATHS)
+    assert cfg.mounts == []
 
 
 def test_load_project_config(repo: Path) -> None:
@@ -156,3 +172,17 @@ def test_load_user_config(isolated_dirs: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text('engine = "docker"\n')
     assert config.load_user_config().engine == "docker"
+
+
+def test_mount_paths_with_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = parse_project_config(
+        {
+            "image": "i",
+            "mounts": [{"source": "~/.agents/skills"}, {"source": "/a", "target": "{home}/a"}],
+        }
+    )
+    assert cfg.mounts == [
+        MountSpec(f"{tmp_path}/.agents/skills", "~/.agents/skills"),
+        MountSpec("/a", "{home}/a"),
+    ]

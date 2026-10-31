@@ -23,14 +23,25 @@ pass = ["TERM", "COLORTERM", "LANG", "LC_ALL", "TZ"]
 CLAUDE_CONFIG_DIR = "{{home}}/.claude"
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 
+[workspace]
+# Read-only inside the sandbox: configuration that tools on the host execute or trust.
+# A missing path is created as an empty directory, so the agent cannot create it either.
+protected = [".claude", ".agents", ".vscode", ".idea"]
+# Replaced by a volume of this workspace: the sandbox builds its own copy (virtualenv,
+# node_modules) and never writes the one the host runs.
+isolated = [".venv", "node_modules"]
+
 [state]
 # Directories below the container user's home that survive `rm` and `recreate`.
-paths = [".claude", ".copilot"]
+paths = [".claude", ".copilot", ".cache/pre-commit"]
 
 # Extra read-only bind mounts. The source must exist and must not contain unix sockets.
+# `~` in source is your home directory; `~` in target is the container user's home.
 # [[mounts]]
 # source = "/ceph"
 # target = "/ceph"
+# [[mounts]]
+# source = "~/.agents/skills"
 
 # [proxy]
 # base_image = "docker.ops.corp.example/upstream/alpine:3"

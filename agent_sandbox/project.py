@@ -65,6 +65,11 @@ class Project:
             return f"{PREFIX}-state-{self.id}-{suffix}"
         return f"{PREFIX}-state-shared-{scope}-{suffix}"
 
+    def isolated_volume(self, rel_path: str) -> str:
+        # The digest keeps `.venv` and `venv` apart; slugify maps both to the same name.
+        digest = hashlib.sha256(rel_path.encode()).hexdigest()[:6]
+        return f"{PREFIX}-isolated-{self.id}-{slugify(rel_path.replace('/', '-'))}-{digest}"
+
     def labels(self, role: str) -> dict[str, str]:
         return {
             LABEL_MANAGED: "true",

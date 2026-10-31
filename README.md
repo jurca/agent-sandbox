@@ -3,6 +3,17 @@
 Per-workspace containers for AI agent harnesses (Claude Code, Copilot CLI), with the workspace
 bind-mounted, `.git` read-only and network access only through an allowlisting proxy.
 
+## What it does not protect against
+
+The agent writes code that you then run: tests started on the host by pre-commit or by hand,
+build scripts, CI jobs that hold tokens and deploy keys. Any of it runs with full rights there and
+could exfiltrate secrets. The sandbox only ensures nothing the agent wrote runs outside it without
+you choosing to run it, so review changes before running them where secrets live.
+
+Network access is closed by default for the same reason: agents, like people, can be manipulated
+(prompt injection), so the sandbox limits what a manipulated agent can reach instead of trusting it
+to resist. See `agent-sandbox help security`.
+
 ## Requirements
 
 - Linux, Python 3.12+ (standard library only)

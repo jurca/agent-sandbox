@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .util import SandboxError, config_dir
@@ -17,9 +17,10 @@ ALLOW_BASE_FILE = "allow.base"
 ALLOW_EXTRA_FILE = "allow.extra"
 APPROVED_FILES = (CONFIG_FILE, PROXY_CONF_FILE, ALLOW_BASE_FILE, ALLOW_EXTRA_FILE)
 
-WORKSPACE_TARGET = "/workspace"
 DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
-DEFAULT_STATE_PATHS = (".claude", ".copilot")
+DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
+DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea")
+DEFAULT_ISOLATED = (".venv", "node_modules")
 DEFAULT_PROXY_BASE_IMAGE = "alpine:3"
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
@@ -28,7 +29,12 @@ _VOLUME_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]*$")
 
 @dataclass(frozen=True)
 class MountSpec:
-    """An extra read-only bind mount."""
+    """An extra read-only bind mount.
+
+    `source` is an absolute host path (`~` already expanded). `target` is absolute, or starts
+    with `~` / `{home}` for the container user's home directory, which is only known once the
+    image is built.
+    """
 
     source: str
     target: str
@@ -42,6 +48,8 @@ class ProjectConfig:
     env_set: dict[str, str] = field(default_factory=dict)
     mounts: list[MountSpec] = field(default_factory=list)
     state_paths: list[str] = field(default_factory=lambda: list(DEFAULT_STATE_PATHS))
+    protected: list[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED))
+    isolated: list[str] = field(default_factory=lambda: list(DEFAULT_ISOLATED))
     proxy_base_image: str | None = None
 
 
@@ -84,6 +92,34 @@ def _string_list(value: Any, where: str) -> list[str]:
     return list(value)
 
 
+def _workspace_paths(value: Any, where: str) -> list[str]:
+    """Normalised paths relative to the workspace root, outside `.git` and the config dir."""
+    paths: list[str] = []
+    for raw in _string_list(value, where):
+        path = PurePosixPath(raw)
+        if not raw or path.is_absolute() or ".." in path.parts or str(path) == ".":
+            raise SandboxError(f"{where}: {raw!r} must be a path inside the workspace.")
+        if path.parts[0] in (".git", PROJECT_DIR):
+            raise SandboxError(f"{where}: {raw!r} is already read-only in the sandbox.")
+        paths.append(str(path))
+    return paths
+
+
+def _overlaps(a: str, b: str) -> bool:
+    pa, pb = PurePosixPath(a), PurePosixPath(b)
+    return pa == pb or pa in pb.parents or pb in pa.parents
+
+
+def _mount_source(raw: str) -> str:
+    if raw == "~" or raw.startswith("~/"):
+        return str(Path.home()) + raw[1:]
+    return raw
+
+
+def _is_home_relative(target: str) -> bool:
+    return any(target == p or target.startswith(p + "/") for p in ("~", "{home}"))
+
+
 def _load_toml(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as handle:
@@ -95,7 +131,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
 
 def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> ProjectConfig:
-    _only(data, {"image", "harness", "env", "mounts", "state", "proxy"}, where)
+    _only(data, {"image", "harness", "env", "workspace", "mounts", "state", "proxy"}, where)
     image = data.get("image")
     if not isinstance(image, str) or not image.strip():
         raise SandboxError(
@@ -132,9 +168,36 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         source, target = entry.get("source"), entry.get("target", entry.get("source"))
         if not isinstance(source, str) or not isinstance(target, str):
             raise SandboxError(f"{where}: mounts entry {index} needs string `source` and `target`.")
-        if not source.startswith("/") or not target.startswith("/"):
-            raise SandboxError(f"{where}: mounts entry {index}: paths must be absolute.")
+        source = _mount_source(source)
+        if not source.startswith("/"):
+            raise SandboxError(
+                f"{where}: mounts entry {index}: source must be absolute or start with `~`."
+            )
+        if not target.startswith("/") and not _is_home_relative(target):
+            raise SandboxError(
+                f"{where}: mounts entry {index}: target must be absolute or start with "
+                "`~` or `{home}`."
+            )
         mounts.append(MountSpec(source.rstrip("/") or "/", target.rstrip("/") or "/"))
+
+    workspace = _table(data, "workspace", where)
+    _only(workspace, {"protected", "isolated"}, f"{where} [workspace]")
+    protected = (
+        _workspace_paths(workspace["protected"], f"{where} [workspace] protected")
+        if "protected" in workspace
+        else list(DEFAULT_PROTECTED)
+    )
+    isolated = (
+        _workspace_paths(workspace["isolated"], f"{where} [workspace] isolated")
+        if "isolated" in workspace
+        else list(DEFAULT_ISOLATED)
+    )
+    for a in protected:
+        for b in isolated:
+            if _overlaps(a, b):
+                raise SandboxError(
+                    f"{where}: [workspace] {a!r} cannot be both protected and isolated."
+                )
 
     state = _table(data, "state", where)
     _only(state, {"paths"}, f"{where} [state]")
@@ -163,6 +226,8 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         env_set=dict(env_set_raw),
         mounts=mounts,
         state_paths=state_paths,
+        protected=protected,
+        isolated=isolated,
         proxy_base_image=base,
     )
 

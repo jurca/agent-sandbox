@@ -9,9 +9,9 @@ import subprocess
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from .config import PROJECT_DIR, WORKSPACE_TARGET, MountSpec
+from .config import PROJECT_DIR, MountSpec
 from .util import SandboxError, config_dir, runtime_dir, state_dir
 
 ACL_BATCH = 200
@@ -60,8 +60,19 @@ def sensitive_paths(home: Path) -> list[Path]:
     return resolved
 
 
-def validate_extra_mounts(specs: Iterable[MountSpec], home: Path) -> list[BindMount]:
+def expand_home(target: str, container_home: str) -> str:
+    """`~` and `{home}` at the start of a mount target mean the container user's home."""
+    for prefix in ("~", "{home}"):
+        if target == prefix or target.startswith(prefix + "/"):
+            return str(PurePosixPath(container_home + target[len(prefix) :]))
+    return target
+
+
+def validate_extra_mounts(
+    specs: Iterable[MountSpec], home: Path, *, workspace: Path, container_home: str
+) -> list[BindMount]:
     sensitive = sensitive_paths(home)
+    root = PurePosixPath(workspace)
     mounts: list[BindMount] = []
     for spec in specs:
         source = Path(spec.source)
@@ -80,12 +91,33 @@ def validate_extra_mounts(specs: Iterable[MountSpec], home: Path) -> list[BindMo
                 raise SandboxError(
                     f"Mount source {spec.source} would expose {protected} to the sandbox; refusing."
                 )
-        if spec.target == WORKSPACE_TARGET or spec.target.startswith(WORKSPACE_TARGET + "/"):
-            raise SandboxError(
-                f"Mount target {spec.target} is inside {WORKSPACE_TARGET}; refusing."
-            )
-        mounts.append(BindMount(str(resolved), spec.target, readonly=True))
+        target = PurePosixPath(expand_home(spec.target, container_home))
+        if target == root or root in target.parents:
+            raise SandboxError(f"Mount target {target} is inside the workspace {root}; refusing.")
+        if target in root.parents:
+            raise SandboxError(f"Mount target {target} would cover the workspace {root}; refusing.")
+        mounts.append(BindMount(str(resolved), str(target), readonly=True))
     return mounts
+
+
+def workspace_path(root: Path, rel: str) -> Path:
+    """`root/rel`, refusing symlinks on the way: a mount there would leave the workspace."""
+    path = root
+    for part in PurePosixPath(rel).parts:
+        path /= part
+        if path.is_symlink():
+            raise SandboxError(f"{path} is a symlink; refusing to mount over it.")
+    return path
+
+
+def ensure_mountpoint(root: Path, rel: str, *, file_ok: bool) -> Path:
+    """`root/rel`, created as an empty directory when missing."""
+    path = workspace_path(root, rel)
+    if not path.exists():
+        path.mkdir(parents=True)
+    elif not path.is_dir() and not file_ok:
+        raise SandboxError(f"{path} exists but is not a directory.")
+    return path
 
 
 # --- sockets ----------------------------------------------------------------------------
@@ -150,12 +182,14 @@ def acl_tools_available() -> bool:
 
 
 def _walk_for_acls(root: Path, exclude: frozenset[str]) -> tuple[list[str], list[str]]:
+    """Directories and regular files below `root`, minus `exclude` (paths relative to root)."""
     dirs: list[str] = []
     files: list[str] = []
     for current, dirnames, filenames in os.walk(root, followlinks=False):
-        if Path(current) == root:
-            dirnames[:] = [d for d in dirnames if d not in exclude]
-            filenames[:] = [f for f in filenames if f not in exclude]
+        rel = os.path.relpath(current, root)
+        prefix = "" if rel == "." else rel + "/"
+        dirnames[:] = [d for d in dirnames if prefix + d not in exclude]
+        filenames[:] = [f for f in filenames if prefix + f not in exclude]
         dirs.append(current)
         for name in filenames:
             path = os.path.join(current, name)
@@ -182,7 +216,7 @@ def apply_acls(
     Rootless docker maps container uid N to a sub-uid, so plain ownership cannot work.
     Default ACLs keep access symmetric for files created later by either side. `.git` and
     the config directory are skipped by default: they stay owned by the host user, which
-    makes them read-only for the container user.
+    makes them read-only for the container user. `skip` holds paths relative to `root`.
 
     Returns the number of paths setfacl could not change (e.g. files you do not own).
     """

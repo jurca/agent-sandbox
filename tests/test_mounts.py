@@ -47,12 +47,14 @@ def test_bind_mount_args() -> None:
     ]
 
 
+def validate(specs: list[MountSpec], home: Path) -> list[BindMount]:
+    return validate_extra_mounts(specs, home, workspace=Path("/w/proj"), container_home="/home/dev")
+
+
 def test_validate_extra_mounts_accepts_ordinary_dirs(home: Path) -> None:
     data = home / "projects" / "data"
     (home / "link").symlink_to(data)
-    result = validate_extra_mounts(
-        [MountSpec(str(data), "/data"), MountSpec(str(home / "link"), "/link")], home
-    )
+    result = validate([MountSpec(str(data), "/data"), MountSpec(str(home / "link"), "/link")], home)
     assert result == [BindMount(str(data), "/data"), BindMount(str(data), "/link")]
     assert all(m.readonly for m in result)
 
@@ -64,44 +66,83 @@ def test_validate_extra_mounts_refuses_sensitive_trees(home: Path, rel: str) -> 
     source = home / rel
     source.mkdir(parents=True, exist_ok=True)
     with pytest.raises(SandboxError, match="would expose"):
-        validate_extra_mounts([MountSpec(str(source), "/x")], home)
+        validate([MountSpec(str(source), "/x")], home)
 
 
 @pytest.mark.parametrize("source", ["/proc", "/sys/kernel", "/run", "/var/run", "/", "/etc/shadow"])
 def test_validate_extra_mounts_refuses_system_trees(home: Path, source: str) -> None:
     with pytest.raises(SandboxError):
-        validate_extra_mounts([MountSpec(source, "/x")], home)
+        validate([MountSpec(source, "/x")], home)
 
 
 def test_validate_extra_mounts_refuses_symlink_into_sensitive(home: Path) -> None:
     (home / "projects" / "innocent").symlink_to(home / ".ssh")
     with pytest.raises(SandboxError, match="would expose"):
-        validate_extra_mounts([MountSpec(str(home / "projects" / "innocent"), "/x")], home)
+        validate([MountSpec(str(home / "projects" / "innocent"), "/x")], home)
 
 
 def test_validate_extra_mounts_refuses_toolkit_dirs(home: Path, isolated_dirs: Path) -> None:
     (isolated_dirs / "state" / "approved").mkdir(parents=True)
     with pytest.raises(SandboxError, match="would expose"):
-        validate_extra_mounts([MountSpec(str(isolated_dirs / "state" / "approved"), "/x")], home)
+        validate([MountSpec(str(isolated_dirs / "state" / "approved"), "/x")], home)
 
 
 def test_validate_extra_mounts_refuses_missing_socket_device(home: Path, unix_socket: Path) -> None:
     with pytest.raises(SandboxError, match="does not exist"):
-        validate_extra_mounts([MountSpec(str(home / "nope"), "/x")], home)
+        validate([MountSpec(str(home / "nope"), "/x")], home)
     with pytest.raises(SandboxError, match="socket or device"):
-        validate_extra_mounts([MountSpec(str(unix_socket), "/x")], home)
+        validate([MountSpec(str(unix_socket), "/x")], home)
     with pytest.raises(SandboxError):
-        validate_extra_mounts([MountSpec("/dev/null", "/x")], home)
+        validate([MountSpec("/dev/null", "/x")], home)
 
 
-@pytest.mark.parametrize("target", ["/workspace", "/workspace/sub"])
+@pytest.mark.parametrize("target", ["/w/proj", "/w/proj/sub"])
 def test_validate_extra_mounts_refuses_targets_in_workspace(home: Path, target: str) -> None:
-    with pytest.raises(SandboxError, match="inside /workspace"):
-        validate_extra_mounts([MountSpec(str(home / "projects"), target)], home)
+    with pytest.raises(SandboxError, match="inside the workspace /w/proj"):
+        validate([MountSpec(str(home / "projects"), target)], home)
+
+
+@pytest.mark.parametrize("target", ["/w", "/"])
+def test_validate_extra_mounts_refuses_targets_above_workspace(home: Path, target: str) -> None:
+    with pytest.raises(SandboxError, match="would cover the workspace"):
+        validate([MountSpec(str(home / "projects"), target)], home)
 
 
 def test_validate_extra_mounts_allows_similar_target(home: Path) -> None:
-    assert validate_extra_mounts([MountSpec(str(home / "projects"), "/workspace2")], home)
+    assert validate([MountSpec(str(home / "projects"), "/w/proj2")], home)
+
+
+@pytest.mark.parametrize(
+    ("target", "expanded"),
+    [("~", "/home/dev"), ("~/.agents/skills", "/home/dev/.agents/skills"),
+     ("{home}/x", "/home/dev/x"), ("/abs/~", "/abs/~"), ("~other", "~other")],
+)  # fmt: skip
+def test_expand_home(target: str, expanded: str) -> None:
+    assert mounts.expand_home(target, "/home/dev") == expanded
+
+
+def test_validate_extra_mounts_expands_home_target(home: Path) -> None:
+    data = home / "projects"
+    result = validate([MountSpec(str(data), "~/.agents/skills")], home)
+    assert result == [BindMount(str(data), "/home/dev/.agents/skills")]
+
+
+def test_workspace_path_refuses_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "sub").symlink_to(tmp_path / "real")
+    assert mounts.workspace_path(tmp_path, "a/b") == tmp_path / "a" / "b"
+    with pytest.raises(SandboxError, match="symlink"):
+        mounts.workspace_path(tmp_path, "sub/.venv")
+    with pytest.raises(SandboxError, match="symlink"):
+        mounts.workspace_path(tmp_path, "sub")
+
+
+def test_ensure_mountpoint(tmp_path: Path) -> None:
+    assert mounts.ensure_mountpoint(tmp_path, "a/.venv", file_ok=False).is_dir()
+    (tmp_path / ".envrc").write_text("")
+    assert mounts.ensure_mountpoint(tmp_path, ".envrc", file_ok=True).is_file()
+    with pytest.raises(SandboxError, match="not a directory"):
+        mounts.ensure_mountpoint(tmp_path, ".envrc", file_ok=False)
 
 
 def test_scan_finds_sockets_without_following_symlinks(tmp_path: Path, unix_socket: Path) -> None:
@@ -158,8 +199,24 @@ def test_apply_acls_skips_git_and_config(repo: Path) -> None:
         ).stdout
 
     assert f"user:{other}:rw" in acl(repo / "src" / "a.py")
+
     assert f"default:user:{other}:rwx" in acl(repo / "src")
     assert f"default:user:{os.getuid()}:rwx" in acl(repo / "src")
     for skipped in (repo / ".git", repo / ".git" / "HEAD", repo / ".agent-sandbox" / "config.toml"):
         assert str(other) not in acl(skipped), skipped
     assert str(other) not in acl(Path("/etc/hostname"))
+
+
+def test_walk_for_acls_skips_relative_paths(tmp_path: Path) -> None:
+    for rel in (".venv/lib", "backend/.venv/lib", "backend/src", "src"):
+        (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / "backend" / ".venv" / "lib" / "x.py").write_text("")
+    (tmp_path / "backend" / "src" / "a.py").write_text("")
+    dirs, files = mounts._walk_for_acls(tmp_path, frozenset({".venv", "backend/.venv"}))
+    assert sorted(Path(d).relative_to(tmp_path).as_posix() for d in dirs) == [
+        ".",
+        "backend",
+        "backend/src",
+        "src",
+    ]
+    assert files == [str(tmp_path / "backend" / "src" / "a.py")]

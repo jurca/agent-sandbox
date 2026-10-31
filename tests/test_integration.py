@@ -275,7 +275,7 @@ def test_exec_runs_as_host_user_with_sandbox_environment(env: Env, workspace: Pa
     )
     uid, gid, cwd, umask, proxy_line, claude_dir, safe = out.split("\n")[:7]
     assert (uid, gid) == (str(os.getuid()), str(os.getgid()))
-    assert cwd == "/workspace"
+    assert cwd == str(workspace.resolve())  # the workspace keeps its host path
     current = os.umask(0)
     os.umask(current)
     assert umask == f"{current:04o}"
@@ -288,28 +288,43 @@ def test_workspace_is_shared_and_git_and_config_are_read_only(env: Env, workspac
     sh(
         env,
         workspace,
-        "echo from-sandbox > /workspace/made-inside && mkdir -p /workspace/d/e"
-        " && echo x > /workspace/d/e/f",
+        "echo from-sandbox > made-inside && mkdir -p d/e && echo x > d/e/f",
     )
     made = workspace / "made-inside"
     assert made.read_text() == "from-sandbox\n"
     made.write_text("host can write\n")  # default ACL gives the host user access back
     (workspace / "d" / "e" / "f").unlink()
     (workspace / "host-file").write_text("x")
-    assert (
-        sh(env, workspace, "cat /workspace/host-file; echo >> /workspace/host-file && echo w")
-        == "xw\n"
-    )
+    assert sh(env, workspace, "cat host-file; echo >> host-file && echo w") == "xw\n"
     script = (
-        "for p in /workspace/.git/x /workspace/.git/hooks/pre-commit /workspace/.agent-sandbox/x;"
+        "for p in .git/x .git/hooks/pre-commit .agent-sandbox/x;"
         ' do if touch "$p" 2>/dev/null; then echo "writable $p"; fi; done;'
-        " git -C /workspace status --short >/dev/null && echo status-ok;"
-        " git -C /workspace commit -q --allow-empty -m x 2>/dev/null || echo commit-refused"
+        " git status --short >/dev/null && echo status-ok;"
+        " git commit -q --allow-empty -m x 2>/dev/null || echo commit-refused"
     )
     assert sh(env, workspace, script) == "status-ok\ncommit-refused\n"
     for name in ("made-inside", "host-file", "d"):
         target = workspace / name
         shutil.rmtree(target) if target.is_dir() else target.unlink()
+
+
+def test_protected_paths_are_read_only_and_isolated_paths_are_separate(
+    env: Env, workspace: Path
+) -> None:
+    (workspace / ".venv" / "host-marker").write_text("host venv")
+    script = (
+        "for p in .claude/settings.local.json .agents/x .vscode/x .idea/x;"
+        ' do if touch "$p" 2>/dev/null; then echo "writable $p"; fi; done;'
+        " ls -A .venv | grep -c host-marker;"
+        " stat -c %u .venv node_modules; touch .venv/made-inside && echo venv-writable"
+    )
+    uid = str(os.getuid())
+    assert sh(env, workspace, script).split() == ["0", uid, uid, "venv-writable"]
+    for rel in (".claude", ".agents", ".vscode", ".idea"):
+        assert (workspace / rel).is_dir() and not any((workspace / rel).iterdir())
+    assert not (workspace / ".venv" / "made-inside").exists()
+    ok(env, workspace, "recreate")
+    assert sh(env, workspace, "ls .venv") == "made-inside\n"  # the volume survives recreate
 
 
 def test_state_dirs_belong_to_the_user_and_survive_recreate(env: Env, scratch: Path) -> None:
@@ -364,13 +379,13 @@ def test_status_and_doctor(env: Env, workspace: Path) -> None:
 def test_repair_restores_acls(env: Env, workspace: Path) -> None:
     target = workspace / "acl-target"
     target.write_text("x")
-    sh(env, workspace, "echo y >> /workspace/acl-target")
+    sh(env, workspace, "echo y >> acl-target")
     subprocess.run(["setfacl", "-b", str(target)], check=True)
     target.chmod(0o644)
-    refused = sh(env, workspace, "echo z >> /workspace/acl-target 2>/dev/null || echo refused")
+    refused = sh(env, workspace, "echo z >> acl-target 2>/dev/null || echo refused")
     assert refused == "refused\n"
     ok(env, workspace, "repair")
-    assert sh(env, workspace, "echo z >> /workspace/acl-target && echo ok") == "ok\n"
+    assert sh(env, workspace, "echo z >> acl-target && echo ok") == "ok\n"
     target.unlink()
 
 
@@ -574,7 +589,7 @@ def test_drift_requires_recreate(env: Env, scratch: Path) -> None:
         assert drift.code == 1 and "changed: git, mounts" in drift.err
         assert "DIFFERS" in ok(env, scratch, "status").out
         ok(env, scratch, "recreate")
-        assert sh(env, scratch, "touch /workspace/.git/rw-test && echo rw") == "rw\n"
+        assert sh(env, scratch, "touch .git/rw-test && echo rw") == "rw\n"
     finally:
         env.user_config.unlink()
         (scratch / ".git" / "rw-test").unlink(missing_ok=True)
@@ -634,13 +649,16 @@ def test_linked_worktree_with_shared_state_volume(env: Env, workspace: Path) -> 
     tree = tree.resolve()
     shared = "asb-it-shared"
     volume = f"agent-sandbox-state-shared-{shared}-claude"
-    shared_volumes = [volume, f"agent-sandbox-state-shared-{shared}-copilot"]
+    shared_volumes = [
+        f"agent-sandbox-state-shared-{shared}-{suffix}"
+        for suffix in ("claude", "copilot", "cache-pre-commit")
+    ]
     env.user_config.write_text(f'[workspaces."{tree}"]\nstate_volume = "{shared}"\n')
     try:
         configure(tree, env)
         common = workspace / ".git"
         script = (
-            "git -C /workspace log --oneline | wc -l;"
+            "git log --oneline | wc -l;"
             f" touch {common}/x 2>/dev/null || echo common-ro; ls -d {common}/worktrees"
         )
         out = sh(env, tree, script)
@@ -672,7 +690,7 @@ def test_clone_flow(env: Env, workspace: Path) -> None:
     try:
         result = ok(env, outside, "--image", IMAGE, str(bare), str(target), stdin="pwd\n")
         assert "Created .agent-sandbox/" in result.err
-        assert result.out.strip() == "/workspace"
+        assert result.out.strip() == str(target.resolve())
     finally:
         asb(env, target, "rm", "--state")
 

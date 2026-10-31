@@ -14,9 +14,27 @@ Key properties:
 - The **container is the security boundary**. No nested bubblewrap sandbox, no relaxed
   seccomp/AppArmor, no VS Code server attached (it forwards sockets that can take over the host).
   Harnesses are run from a terminal via `exec` (CLI harnesses: Claude Code, Copilot CLI, OpenCode).
-- The workspace is **bind-mounted** (read-write); review and commits happen on the host.
-  `.git` and `.agent-sandbox/` are mounted **read-only** so git hooks, `.git/config` (fsmonitor,
-  diff drivers...) and the toolkit configuration cannot be planted by the agent.
+- The workspace is **bind-mounted** (read-write) **at its host path**; review and commits happen on
+  the host. `.git` and `.agent-sandbox/` are mounted **read-only** so git hooks, `.git/config`
+  (fsmonitor, diff drivers...) and the toolkit configuration cannot be planted by the agent.
+- Anything the agent writes that the host later **executes or trusts** is an escape route.
+  Tracked files show up in `git diff`; gitignored ones do not. So configuration that host tools
+  execute (`.claude/` hooks incl. the ignored `settings.local.json`, `.agents/`, `.vscode/`,
+  `.idea/`) is **protected** (read-only), and dependency trees the host runs (`.venv`,
+  `node_modules`) are **isolated**: the sandbox gets its own copy in a volume and never writes the
+  host's.
+- What remains is **inescapable by design**: the agent's job is to write code that you then run.
+  Tests started on the host by pre-commit or by hand, build scripts, a `Makefile`, a dev server,
+  CI jobs (which often hold deploy keys and tokens in their environment): any of it can do
+  anything the user or the CI runner can, including exfiltrating secrets. The sandbox only makes
+  sure the agent's code runs *outside* it after a human chose to run it, never on its own. Review
+  agent changes before running them where secrets live.
+- That is also why network access is closed by default. People are manipulated against their own
+  interests every day; it would be unfair to expect an LLM agent to withstand every prompt
+  injection. So the design does not rely on the agent resisting manipulation. It limits where the
+  agent may be exposed to manipulation by managing a network domain allowlist, and what a
+  manipulated agent can reach: the allowlisted model APIs normally, more only for a limited time
+  the user opened.
 - The container sits on an **internal network** (no route out). Its only way out is a tinyproxy
   container with an allowlist. Blocking the internal network (10.0.0.0/8) by default is required
   by company security policy.
@@ -45,6 +63,7 @@ Per workspace (identified by `<dirname>-<8 hex of sha256(abs path)>`, called `<i
 | proxy container | `agent-sandbox-<id>-proxy` | tinyproxy + supervisor as `nobody`, no host mounts, on the internal and the default network; stateless, replaced when its image changes |
 | network | `agent-sandbox-<id>-net` | `--internal`; proxy has alias `proxy` |
 | state volumes | `agent-sandbox-state-<id>-<path>` | harness state, one volume per configured path |
+| isolated volumes | `agent-sandbox-isolated-<id>-<path>-<6 hex of sha256(path)>` | the sandbox's own copy of an isolated workspace path (the hash keeps `.venv` and `venv` apart) |
 | runtime dir | `$XDG_RUNTIME_DIR/agent-sandbox/<id>/` | the CLI's own records: lock, deadline copy, `net` session and pid |
 | derived image | `localhost/agent-sandbox/<user>-<flattened base>:<tag>` | base image plus the host user |
 | proxy image | `localhost/agent-sandbox/tinyproxy:<hash>` | tinyproxy built locally from a configurable base (default public `alpine:3`) |
@@ -61,10 +80,22 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 - Host umask applied through `sh -c 'umask ...; exec "$@"'` on every exec.
 - Hardening: default seccomp/AppArmor, `no-new-privileges`, default capabilities (so `root` can
   `apt`), `--init`, no memory limit, no restart policy.
-- Mounts: workspace -> `/workspace` rw; `.git` ro (file or directory); `.agent-sandbox` ro; for linked
-  worktrees/submodules the git common dir (and per-worktree dir if outside it) ro at its identical
-  host path; extra read-only mounts from config; state volumes under the container home.
-  `git = "rw"` is a user-level-only opt-in.
+- Mounts (every workspace path keeps its host path inside, and the working directory of the
+  container and of every exec is the workspace root):
+  - workspace rw; `.git` ro (file or directory); `.agent-sandbox` ro;
+  - each protected path ro (a directory or a file); missing ones are first created on the host as
+    empty directories;
+  - each isolated path covered by its per-workspace volume (missing ones are created on the host
+    as empty directories first);
+  - for linked worktrees/submodules the git common dir (and per-worktree dir if outside it) ro at
+    its identical host path;
+  - extra read-only mounts from config (`~` in the target is the container home);
+  - state volumes under the container home.
+- `git = "rw"` (writable `.git` and external git dirs) is a user-level-only opt-in.
+- Mirroring the host path keeps absolute paths meaningful on both sides: tool output and
+  tracebacks are clickable on the host, caches and editable installs (`.pth`) agree, worktree
+  `gitdir:` pointers resolve, and harnesses that key per-project state by the working directory
+  (Claude Code's `~/.claude/projects/<path>`) no longer collide in a shared state volume.
 - Environment at exec time (so changes need no recreate): proxy variables pointing at
   `http://proxy:8888`, git `safe.directory=*`, `GIT_OPTIONAL_LOCKS=0`, `AGENT_SANDBOX=1`, the
   configured `[env] pass` names (only if set on the host) and `[env.set]` values (`{home}` expands).
@@ -78,19 +109,34 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 
 - Podman rootless: `--userns=keep-id`.
 - Docker rootless: container uid N maps to a sub-uid on the host (uid 1000 appears as 100999), so
-  default ACLs (`setfacl`) give that host uid access; `.git` and `.agent-sandbox` are skipped so they
-  stay owned by the host user (read-only for the container user). With `git = "rw"`, `.git` and any
+  default ACLs (`setfacl`) give that host uid access; `.git`, `.agent-sandbox`, protected and
+  isolated paths are skipped (matched as paths relative to the workspace root, at any depth): the
+  first three stay owned by the host user, and walking a host virtualenv the sandbox never sees would
+  only cost time. With `git = "rw"`, `.git` and any
   external git dirs get the ACLs too (otherwise the rw mount would not be writable). The mapping is read from
   `/proc/self/uid_map` inside a container. Applied at creation and by `repair`.
 - Rootful engines: same uid; requires `allow_rootful = true` in the user config.
+- Volume roots (state paths and their parents under the container home, isolated paths
+  themselves but not their workspace parents) are created root-owned by the engine and are chowned
+  to the sandbox user from a root exec after creation and by `repair`.
 
 ## 4. Configuration
 
 ### Project: `.agent-sandbox/` (committed)
 
 - `config.toml`: `image` (required), `harness` (default `bash`), `[env] pass`/`[env.set]`,
-  `[[mounts]]` (`source`, `target`, always read-only), `[state] paths` (default `.claude`,
-  `.copilot`), `[proxy] base_image`. Unknown keys are errors.
+  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`), `[workspace]
+  isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target` defaulting to
+  `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
+  `.cache/pre-commit`), `[proxy] base_image`. Unknown keys are errors.
+- Workspace paths (`protected`, `isolated`) are relative to the workspace root and normalised
+  (`./x/` -> `x`); absolute paths, `..`, `.`, anything under `.git` or `.agent-sandbox` (already
+  read-only) and a path that is protected and isolated at once (equal or nested) are errors.
+  Nested paths such as `web/node_modules` are allowed.
+- Mount paths: `source` is absolute or starts with `~` (the host home, expanded when parsing);
+  `target` is absolute or starts with `~` / `{home}` (the container home, expanded when planning
+  the container, because it is only known from the image). Typical use: `source =
+  "~/.agents/skills"` with the target defaulting to the same `~` path.
 - `tinyproxy.conf`: static settings only (Timeout, ConnectPort...). The toolkit generates Port, Allow,
   Filter*, Upstream, Log*, PidFile and rejects those directives here.
 - `allow.base`, `allow.extra`: one host per line, `#` comments. `host` matches exactly; `.host`
@@ -115,8 +161,10 @@ step record approval themselves.
 
 ### Drift detection
 
-A hash of the container-creation inputs (engine, base image id, uid/gid, ownership mode, git mode,
-mounts, state volumes, network) is stored as a label with the full JSON. On attach a mismatch aborts
+A hash of the container-creation inputs (spec version, engine, base image id, uid/gid, ownership
+mode, git mode, mounts incl. protected paths, state volumes, isolated volumes and their targets,
+network) is stored as a label with the full JSON. The container home used to expand mount targets
+is stored as a label too, so the check expands them the same way. On attach a mismatch aborts
 with the list of changed keys and tells the user to run `recreate`.
 
 ## 5. Network and proxy
@@ -183,14 +231,14 @@ with the list of changed keys and tells the user to run `recreate`.
 | `root` | root shell with banner |
 | `net ...` | see section 5 |
 | `stop` | stop workspace and proxy |
-| `rm [NAME] [--state]` | remove containers, network, runtime dir; keeps state volumes unless `--state`; never touches workspace files |
-| `recreate` | remove containers and network (keeps state), then create again |
+| `rm [NAME] [--state]` | remove containers, network, runtime dir; keeps state and isolated volumes unless `--state`; never touches workspace files |
+| `recreate` | remove containers and network (keeps state and isolated volumes), then create again |
 | `rebuild [--pull]` | rebuild derived and proxy images (then `recreate`) |
 | `ls` | all sandboxes on all engines, orphans flagged |
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
 | `status` | state, approval, drift, proxy tier and time left |
 | `doctor` | live isolation checks (no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
-| `repair` | re-apply ACLs and state-dir ownership, clear the deadline if no live `net` process owns it |
+| `repair` | re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
 | `help [config|network|security|COMMAND]` | built-in help is the single source of documentation |
 
 Rules: running in a subdirectory of a repo is an error; per-project lock (flock) serialises creation;
@@ -200,9 +248,13 @@ creation rolls back what it created on failure; at most one network session per 
 
 - Extra mount sources must exist, may not be sockets/devices, and may not be (or contain, or be inside)
   sensitive trees (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gcloud`,
-  `~/.config/gh`, `/run`, `/proc`, `/sys`, `/dev`, toolkit config/state/runtime dirs...). Targets may
-  not be inside `/workspace`.
-- Before creation the workspace, extra mounts and git dirs are scanned (budget: 50k entries / 5 s, a
+  `~/.config/gh`, `/run`, `/proc`, `/sys`, `/dev`, toolkit config/state/runtime dirs...). Targets
+  (after `~` expansion) may not be the workspace, inside it, or a parent of it.
+- Protected and isolated paths may not pass through a symlink at any component (a mount there
+  would leave the workspace). An isolated path that exists as a file is an error; a protected one
+  may be a file.
+- Before creation the workspace and every mount source outside it (extra mounts, external git
+  dirs) are scanned (budget: 50k entries / 5 s, a
   notice if incomplete) for unix sockets. Found sockets abort unless
   `--unsafely-mount-dirs-with-sockets` is given, in which case a warning is printed and the user must
   type `I understand the risks`.
@@ -219,6 +271,14 @@ creation rolls back what it created on failure; at most one network session per 
 - Copilot CLI: `github.com`, `api.github.com`, `.githubcopilot.com` (docs are for Copilot in general,
   not specifically the CLI; verify with the blocked-host log). State: `~/.copilot/`.
 - OpenCode: low priority, hosts depend on the provider (Zen subscription hosts to be determined).
+- pre-commit: keeps hook environments in `~/.cache/pre-commit` (a default state path; safe to share
+  between workspaces, entries are keyed by repo and revision and guarded by a lock). Without
+  `--all-files`/`--files` it "stashes" unstaged changes as a patch in that directory and calls
+  `git write-tree`, which needs a writable `.git`. In `ro` mode the agent cannot stage anything
+  anyway, so plain `pre-commit run` would check the user's staged changes, not the agent's; the
+  agent should run `pre-commit run --all-files` (or `--files ...`).
+- uv: `uv sync` and `uv venv --clear` work when `.venv` is a volume mount point (they clear the
+  contents instead of removing the directory; checked with uv 0.13.4).
 
 ## 9. Testing
 
@@ -230,13 +290,41 @@ creation rolls back what it created on failure; at most one network session per 
   the base image must be local): create and exec, ownership/ACL, read-only `.git`, tiers via
   `CONNECT`/`GET` through `/dev/tcp/proxy/8888`, `net` expiry/extend/stop/SIGKILL, allow-all, promotion,
   approval, drift/recreate, sockets, rm/ls/prune, clone, linked worktree, shared state volume, derived
-  image on Alpine.
+  image on Alpine, host-path working directory, protected paths read-only and created empty on the
+  host, isolated volumes hiding the host copy, owned by the user and surviving `recreate`.
 - Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
 
-## 10. Deferred / out of scope for v1
+## 10. Design decisions and rejected alternatives
+
+- **Shared in-project venv** (mirror paths and mount uv's interpreter directory at its host path):
+  rejected. A venv hardcodes the project path (shebangs, `activate`, editable `.pth` files) and the
+  interpreter path (`bin/python` symlink, `pyvenv.cfg`); even with both available, host and
+  container would rewrite each other's venv, and the agent could plant a `.pth` file that runs on
+  every host Python start without appearing in `git diff`. Isolation by volume is tool-agnostic
+  (unlike `UV_PROJECT_ENVIRONMENT`) and keeps the familiar `.venv/bin/...` path. Cost accepted:
+  dependencies are installed twice (large for e.g. pytorch+CUDA).
+- **Private git storage for pre-commit stashing** (`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` with the
+  host objects as alternates): rejected as complex and diverging from the host index;
+  `--all-files` is the semantically right call in `ro` mode.
+- **Missing protected paths**: created as empty host directories, not covered by an empty read-only
+  directory from toolkit state. The engine creates missing nested mount points on the host anyway,
+  and the existence of the host directory would then flip the mount source and the drift hash on
+  the next attach. Consequence: a missing protected *file* (e.g. `.envrc`) is created as a
+  directory, so only list files that exist.
+- **Per-project namespacing inside shared state volumes**: not done. Mirroring the workspace path
+  already separates per-project state of harnesses that key by working directory, and
+  namespacing would defeat sharing (logins, pre-commit environments).
+- **Protecting `.claude/` costs** Claude Code the ability to persist "always allow" answers in
+  `settings.local.json` and the agent the ability to write project skills/commands directly; it
+  drafts them elsewhere and the user promotes them. A project can drop entries from `protected`.
+
+## 11. Deferred / out of scope for v1
 
 OpenCode defaults; modular "what to install at creation"; replacing the user's separate
 `workspace-sandbox` scripts (to be revisited after solo testing); Podman and rootful verification;
-Squid as an alternative proxy (documented option if IP-level enforcement is ever required).
+Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
+user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
+project config); resolving symlinks inside mounted skill directories (links pointing outside the
+mount dangle in the container).

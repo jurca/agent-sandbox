@@ -25,6 +25,7 @@ from .images import host_uid_for
 from .mounts import has_workspace_acl
 from .net import owner_alive
 from .project import (
+    LABEL_HOME,
     LABEL_ID,
     LABEL_ROLE,
     LABEL_SPEC,
@@ -237,7 +238,7 @@ def status(ctx: Context) -> None:
     if info:
         labels = (info.get("Config") or {}).get("Labels") or {}
         try:
-            plan = make_plan(ctx)
+            plan = make_plan(ctx, labels.get(LABEL_HOME))
             current = spec_hash(compute_spec(ctx, plan, engine.image_id(ctx.config.image)))
             drift = (
                 "matches the configuration"
@@ -359,7 +360,7 @@ def repair(ctx: Context) -> None:
         )
         host_uid = host_uid_for(mapping, ctx.uid)
         if host_uid != os.getuid():
-            failed = share_workspace(ctx, make_plan(ctx), host_uid)
+            failed = share_workspace(ctx, make_plan(ctx, container_home(ctx)), host_uid)
             eprint(f"Re-applied workspace ACLs ({failed} path(s) could not be changed).")
     if engine.container_status(project.workspace_container) == "running":
         fix_state_ownership(ctx, container_home(ctx))

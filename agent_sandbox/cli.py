@@ -33,9 +33,11 @@ OVERVIEW = f"""\
 agent-sandbox - per-workspace sandboxes for AI agent harnesses
 
 A sandbox is a container holding one git working tree. The workspace is bind-mounted
-read-write; `.git` and `{PROJECT_DIR}/` are read-only inside, so commits, hooks and
-configuration stay under your control on the host. The container sits on an internal network
-with no route out; its only way out is a tinyproxy container that allows a short list of hosts.
+read-write at its host path; `.git`, `{PROJECT_DIR}/` and editor/agent configuration (.claude,
+.vscode, ...) are read-only inside, so commits, hooks and configuration stay under your control
+on the host. Virtualenvs and node_modules are separate volumes the host never runs. The
+container sits on an internal network with no route out; its only way out is a tinyproxy
+container that allows a short list of hosts.
 
 USAGE
   agent-sandbox                     Create the sandbox if needed, start it, run the harness.
@@ -52,7 +54,8 @@ COMMANDS
   net --stop                        Open the network for a limited time (see `help network`).
   stop                              Stop the sandbox and its proxy.
   rm [NAME] [--state]               Remove containers and network (workspace files are never
-                                    touched). --state also deletes the harness state volumes.
+                                    touched). --state also deletes the harness state and
+                                    isolated volumes.
   recreate                          Remove and create the containers again (keeps state).
   rebuild [--pull]                  Rebuild the derived workspace image and the proxy image.
   ls                                List sandboxes of all engines; orphaned ones are flagged.
@@ -77,7 +80,7 @@ Project: {PROJECT_DIR}/ at the repository root. Commit it. It is mounted read-on
 sandbox, and the host asks you to approve it (showing a diff) whenever it differs from what you
 approved last, including after a clone or pull.
 
-  {CONFIG_FILE}      image, harness, environment, extra mounts, state directories
+  {CONFIG_FILE}      image, harness, environment, workspace paths, extra mounts, state
   tinyproxy.conf   static tinyproxy settings (Timeout, ConnectPort, ...); agent-sandbox
                    generates the rest and rejects those directives here
   allow.base       hosts reachable whenever the sandbox runs (model APIs, login)
@@ -89,9 +92,16 @@ approved last, including after a clone or pull.
   harness          command line started by a plain `agent-sandbox`
   [env] pass       host variables to pass into the container (when set)
   [env.set]        fixed variables; {{home}} expands to the container home directory
-  [[mounts]]       extra read-only bind mounts: source, target
+  [workspace] protected
+                   workspace paths mounted read-only (default: .claude .agents .vscode
+                   .idea); missing ones are created empty
+  [workspace] isolated
+                   workspace paths replaced by a per-workspace volume, so the sandbox keeps
+                   its own copy (default: .venv node_modules)
+  [[mounts]]       extra read-only bind mounts: source, target (default: source); `~` is
+                   your home in source and the container home in target
   [state] paths    directories under the container home kept in a volume
-                   (per workspace by default)
+                   (per workspace by default; default: .claude .copilot .cache/pre-commit)
   [proxy] base_image   image tinyproxy is installed on (default: alpine:3)
 
 Allowlist syntax (allow.base, allow.extra, --allow)
@@ -155,8 +165,15 @@ SECURITY NOTES
 - `agent-sandbox root` is for setup. In a rootless engine root is your own host user on every
   mount; in a rootful engine it can create root-owned and setuid files in the workspace.
   Do not start a harness from a root shell; that cannot be prevented, only discouraged.
-- Review agent changes on the host: `.git` is read-only in the container, but files the agent
-  wrote (scripts, Makefiles, .vscode/, .envrc) are yours to inspect before you run them.
+- Review agent changes on the host: `.git` and the protected paths are read-only in the
+  container, but files the agent wrote (scripts, Makefiles, .envrc) are yours to inspect
+  before you run them. Gitignored files do not show up in `git diff`; that is why
+  .claude/settings.local.json is protected and virtualenvs are isolated, not shared.
+- The sandbox cannot protect you from code you run yourself. Tests run on the host by
+  pre-commit, build scripts, CI jobs (with their tokens and deploy keys): anything the agent wrote
+  runs with full rights there and could exfiltrate secrets. Review before running.
+- Network access is closed by default because agents, like people, can be manipulated (prompt
+  injection). The design limits what a manipulated agent can reach instead of trusting it.
 - Rootless docker maps the container user to a sub-uid, so the workspace is shared with ACLs
   (setfacl). Podman uses --userns=keep-id. Rootful engines need `allow_rootful = true`.
 - Directories you mount may not contain unix sockets: a read-only mount still lets the

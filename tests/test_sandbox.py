@@ -56,24 +56,46 @@ def configured(repo: Path) -> Path:
 
 def test_plan_for_plain_clone(configured: Path) -> None:
     plan = make_plan(make_ctx(configured))
+    ws = str(configured)
     assert plan.mounts == [
-        BindMount(str(configured), "/workspace", readonly=False),
-        BindMount(str(configured / ".git"), "/workspace/.git", readonly=True),
-        BindMount(str(configured / ".agent-sandbox"), "/workspace/.agent-sandbox", readonly=True),
-    ]
+        BindMount(ws, ws, readonly=False),
+        BindMount(f"{ws}/.git", f"{ws}/.git", readonly=True),
+        BindMount(f"{ws}/.agent-sandbox", f"{ws}/.agent-sandbox", readonly=True),
+        *(BindMount(f"{ws}/{rel}", f"{ws}/{rel}") for rel in (".claude", ".agents", ".vscode",
+                                                                ".idea")),
+    ]  # fmt: skip
     p = project_for(configured)
     assert plan.volumes == [
         (f"agent-sandbox-state-{p.id}-claude", ".claude"),
         (f"agent-sandbox-state-{p.id}-copilot", ".copilot"),
+        (f"agent-sandbox-state-{p.id}-cache-pre-commit", ".cache/pre-commit"),
+    ]
+    assert plan.isolated == [
+        (p.isolated_volume(".venv"), f"{ws}/.venv"),
+        (p.isolated_volume("node_modules"), f"{ws}/node_modules"),
     ]
     assert plan.ownership == "acl"
+
+
+def test_isolated_volume_names_do_not_collide() -> None:
+    p = project_for(Path("/w/x"))
+    assert p.isolated_volume(".venv") != p.isolated_volume("venv")
+    assert p.isolated_volume("a/.venv").startswith(f"agent-sandbox-isolated-{p.id}-a-.venv-")
+
+
+def test_plan_refuses_symlinked_workspace_paths(configured: Path, tmp_path: Path) -> None:
+    (tmp_path / "elsewhere").mkdir()
+    (configured / ".venv").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(SandboxError, match="symlink"):
+        make_plan(make_ctx(configured))
 
 
 def test_plan_for_worktree_mounts_common_dir_at_host_path(repo: Path, tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     git(repo, "worktree", "add", "-q", str(tree))
     plan = make_plan(make_ctx(tree.resolve()))
-    assert plan.mounts[1] == BindMount(str(tree.resolve() / ".git"), "/workspace/.git")
+    git_file = str(tree.resolve() / ".git")
+    assert plan.mounts[1] == BindMount(git_file, git_file)
     assert BindMount(str(repo / ".git"), str(repo / ".git"), readonly=True) in plan.mounts
 
 
@@ -93,7 +115,10 @@ def test_plan_validates_extra_mounts(configured: Path, tmp_path: Path) -> None:
     data = tmp_path / "data"
     data.mkdir()
     config = ProjectConfig(image=IMAGE, mounts=[MountSpec(str(data), "/data")])
-    assert make_plan(make_ctx(configured, config=config)).mounts[3] == BindMount(str(data), "/data")
+    assert BindMount(str(data), "/data") in make_plan(make_ctx(configured, config=config)).mounts
+    config.mounts = [MountSpec(str(data), "~/data")]
+    plan = make_plan(make_ctx(configured, config=config), "/home/someone")
+    assert BindMount(str(data), "/home/someone/data") in plan.mounts
     config.mounts = [MountSpec(str(Path.home() / ".ssh"), "/k")]
     with pytest.raises(SandboxError):
         make_plan(make_ctx(configured, config=config))
@@ -112,7 +137,9 @@ def test_spec_hash_and_differences(configured: Path) -> None:
     ctx = make_ctx(configured)
     plan = make_plan(ctx)
     spec = compute_spec(ctx, plan, "sha256:1")
-    reversed_plan = sandbox.Plan(plan.layout, plan.mounts[::-1], plan.volumes, plan.ownership)
+    reversed_plan = sandbox.Plan(
+        plan.layout, plan.mounts[::-1], plan.volumes, plan.isolated, plan.ownership
+    )
     reordered = compute_spec(ctx, reversed_plan, "sha256:1")
     assert spec_hash(spec) == spec_hash(reordered)
     changed_plan = make_plan(make_ctx(configured, user=UserConfig(git="rw")))
@@ -191,7 +218,7 @@ def test_create_rolls_back_on_failure(configured: Path, monkeypatch: pytest.Monk
     ctx = make_ctx(configured, engine)
     monkeypatch.setattr(sandbox, "ensure_user_image", lambda *a, **k: fake_image())
     monkeypatch.setattr(sandbox, "ensure_proxy_image", lambda *a, **k: "proxy:1")
-    monkeypatch.setattr(sandbox, "apply_acls", lambda root, uid: 0)
+    monkeypatch.setattr(sandbox, "apply_acls", lambda root, uid, **k: 0)
     monkeypatch.setattr(sandbox, "start_proxy", lambda ctx: None)
     engine.on(("create", "--name", ctx.project.workspace_container), lambda args: 1)
     with pytest.raises(EngineError):
@@ -200,6 +227,9 @@ def test_create_rolls_back_on_failure(configured: Path, monkeypatch: pytest.Monk
     removed = [c for c in engine.calls if "rm" in c[:2]]
     assert removed == [
         ("rm", "-f", p.proxy_container),
+        ("volume", "rm", p.isolated_volume("node_modules")),
+        ("volume", "rm", p.isolated_volume(".venv")),
+        ("volume", "rm", f"agent-sandbox-state-{p.id}-cache-pre-commit"),
         ("volume", "rm", f"agent-sandbox-state-{p.id}-copilot"),
         ("volume", "rm", f"agent-sandbox-state-{p.id}-claude"),
         ("network", "rm", p.network),
@@ -212,7 +242,7 @@ def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> 
     acl_calls: list[int] = []
     monkeypatch.setattr(sandbox, "ensure_user_image", lambda *a, **k: fake_image())
     monkeypatch.setattr(sandbox, "ensure_proxy_image", lambda *a, **k: "proxy:1")
-    monkeypatch.setattr(sandbox, "apply_acls", lambda root, uid: acl_calls.append(uid) or 0)
+    monkeypatch.setattr(sandbox, "apply_acls", lambda root, uid, **k: acl_calls.append(uid) or 0)
     monkeypatch.setattr(sandbox, "start_proxy", lambda ctx: None)
     sandbox.create_sandbox(ctx)
     assert acl_calls == [100999]
@@ -222,14 +252,23 @@ def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert "--network " + ctx.project.network in joined
     assert "--security-opt no-new-privileges" in joined and "--init" in joined
     assert "--user 1000:1000" in joined and "--privileged" not in joined
-    assert f"type=bind,src={configured}/.git,dst=/workspace/.git,readonly" in joined
+    assert f"--workdir {configured} " in joined
+    assert f"type=bind,src={configured}/.git,dst={configured}/.git,readonly" in joined
+    assert f"type=bind,src={configured}/.claude,dst={configured}/.claude,readonly" in joined
     assert "dst=/home/dev/.claude" in joined
+    venv_volume = ctx.project.isolated_volume(".venv")
+    assert f"type=volume,src={venv_volume},dst={configured}/.venv" in joined
+    assert (configured / ".idea").is_dir() and (configured / ".venv").is_dir()
     assert create[-2:] == (IMAGE, "infinity")
     assert "--network" not in " ".join(
         next(c for c in engine.calls if c[:3] == ("create", "--name", ctx.project.proxy_container))
     )
     chown = next(c for c in engine.calls if c[:3] == ("exec", "--user", "0"))
-    assert chown[-2:] == ("/home/dev/.claude", "/home/dev/.copilot")
+    assert chown[-6:] == (
+        "/home/dev/.claude", "/home/dev/.copilot",
+        "/home/dev/.cache", "/home/dev/.cache/pre-commit",
+        f"{configured}/.venv", f"{configured}/node_modules",
+    )  # fmt: skip
 
 
 def test_ensure_ready_detects_drift(configured: Path) -> None:
@@ -296,11 +335,12 @@ def test_share_workspace_includes_git_only_when_rw(
     assert sandbox.share_workspace(ctx, make_plan(ctx), os.getuid()) == 0
     assert calls == []  # same uid inside and outside: nothing to share
     sandbox.share_workspace(ctx, make_plan(ctx), 100999)
-    assert calls == [(tree.resolve(), (".git", ".agent-sandbox"))]
+    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
+    assert calls == [(tree.resolve(), (".git", *covered))]
     calls.clear()
     rw = make_ctx(tree.resolve(), user=UserConfig(git="rw"))
     sandbox.share_workspace(rw, make_plan(rw), 100999)
-    assert calls == [(tree.resolve(), (".agent-sandbox",)), (repo / ".git", ())]
+    assert calls == [(tree.resolve(), covered), (repo / ".git", ())]
 
 
 def test_proxy_is_unprivileged_and_configured_before_start(configured: Path) -> None:

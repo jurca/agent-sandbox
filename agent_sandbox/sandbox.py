@@ -20,7 +20,6 @@ from . import approval, proxyctl
 from .config import (
     DEFAULT_PROXY_BASE_IMAGE,
     PROJECT_DIR,
-    WORKSPACE_TARGET,
     ProjectConfig,
     UserConfig,
     load_project_config,
@@ -33,8 +32,10 @@ from .mounts import (
     BindMount,
     VolumeMount,
     apply_acls,
+    ensure_mountpoint,
     scan_for_sockets,
     validate_extra_mounts,
+    workspace_path,
 )
 from .project import (
     LABEL_BASE_ID,
@@ -49,7 +50,7 @@ from .project import (
 from .proxy import PROXY_ALIAS, PROXY_PORT, PROXY_UID
 from .util import SandboxError, eprint, require_phrase, runtime_dir
 
-SPEC_VERSION = 1
+SPEC_VERSION = 2
 PROXY_URL = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
 ROOT_ACK_PHRASE = "I understand the risks"
 STOP_TIMEOUT = "3"
@@ -128,23 +129,40 @@ class Plan:
     layout: GitLayout
     mounts: list[BindMount]
     volumes: list[tuple[str, str]]  # (volume name, path relative to the home directory)
+    isolated: list[tuple[str, str]]  # (volume name, absolute path inside the workspace)
     ownership: str
 
 
-def make_plan(ctx: Context) -> Plan:
+def make_plan(ctx: Context, home: str | None = None) -> Plan:
+    """The desired mounts. The workspace keeps its host path inside the container, so paths
+    in tool output, caches and harness state mean the same on both sides.
+
+    `home` is the container user's home directory, for `~` in mount targets.
+    """
     project, readonly = ctx.project, ctx.git_mode == "ro"
-    layout = git_layout(project.root)
+    root = project.root
+    layout = git_layout(root)
     mounts = [
-        BindMount(str(project.root), WORKSPACE_TARGET, readonly=False),
-        BindMount(str(layout.git_path), f"{WORKSPACE_TARGET}/.git", readonly=readonly),
-        BindMount(
-            str(project.root / PROJECT_DIR), f"{WORKSPACE_TARGET}/{PROJECT_DIR}", readonly=True
-        ),
+        BindMount(str(root), str(root), readonly=False),
+        BindMount(str(layout.git_path), str(root / ".git"), readonly=readonly),
+        BindMount(str(root / PROJECT_DIR), str(root / PROJECT_DIR), readonly=True),
     ]
+    for rel in ctx.config.protected:
+        path = workspace_path(root, rel)
+        mounts.append(BindMount(str(path), str(path), readonly=True))
     mounts += [BindMount(str(d), str(d), readonly=readonly) for d in layout.external_dirs]
-    mounts += validate_extra_mounts(ctx.config.mounts, Path.home())
+    mounts += validate_extra_mounts(
+        ctx.config.mounts,
+        Path.home(),
+        workspace=root,
+        container_home=home or f"/home/{ctx.username}",
+    )
     volumes = [(project.state_volume(ctx.state_scope, rel), rel) for rel in ctx.config.state_paths]
-    return Plan(layout, mounts, volumes, ownership_mode(ctx.engine))
+    isolated = [
+        (project.isolated_volume(rel), str(workspace_path(root, rel)))
+        for rel in ctx.config.isolated
+    ]
+    return Plan(layout, mounts, volumes, isolated, ownership_mode(ctx.engine))
 
 
 def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, object]:
@@ -161,6 +179,7 @@ def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, obj
         "git": ctx.git_mode,
         "mounts": sorted([m.source, m.target, m.readonly] for m in plan.mounts),
         "state": [[name, rel] for name, rel in plan.volumes],
+        "isolated": [[name, target] for name, target in plan.isolated],
         "network": ctx.project.network,
     }
 
@@ -179,7 +198,11 @@ def spec_differences(old: dict[str, object], new: dict[str, object]) -> list[str
 
 def check_sockets(ctx: Context, plan: Plan, *, unsafe: bool) -> None:
     targets = [("the workspace", ctx.project.root)]
-    targets += [(f"mount {m.target}", Path(m.source)) for m in plan.mounts[3:]]
+    targets += [
+        (f"mount {m.target}", Path(m.source))
+        for m in plan.mounts
+        if not Path(m.source).is_relative_to(ctx.project.root)
+    ]
     found: list[tuple[str, Path]] = []
     for label, path in targets:
         result = scan_for_sockets(path)
@@ -279,8 +302,14 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         engine, ctx.config.image, user=ctx.username, uid=ctx.uid, gid=ctx.gid, group=ctx.groupname
     )
     proxy_image = ensure_proxy_image(engine, ctx.proxy_base_image)
-    plan = make_plan(ctx)
+    plan = make_plan(ctx, image.home)
     check_sockets(ctx, plan, unsafe=unsafe_sockets)
+    # Mount points inside the workspace; the engine would create missing ones itself, but
+    # with root-owned results under a rootful engine.
+    for rel in ctx.config.protected:
+        ensure_mountpoint(ctx.project.root, rel, file_ok=True)
+    for rel in ctx.config.isolated:
+        ensure_mountpoint(ctx.project.root, rel, file_ok=False)
 
     if plan.ownership == "acl":
         failed = share_workspace(ctx, plan, host_uid_for(image.uid_map, ctx.uid))
@@ -303,6 +332,11 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
                 labels = {**project.labels("state"), LABEL_STATE_SCOPE: ctx.state_scope}
                 engine.run("volume", "create", *_label_args(labels), volume)
                 created.append(("volume", volume))
+        for volume, _ in plan.isolated:
+            if not engine.exists("volume", volume):
+                labels = {**project.labels("isolated"), LABEL_STATE_SCOPE: "per-workspace"}
+                engine.run("volume", "create", *_label_args(labels), volume)
+                created.append(("volume", volume))
 
         if ensure_proxy_container(ctx, proxy_image):
             created.append(("container", project.proxy_container))
@@ -318,7 +352,7 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         }
         args = [
             "create", "--name", project.workspace_container, "--hostname", project.hostname,
-            "--user", f"{ctx.uid}:{ctx.gid}", "--init", "--workdir", WORKSPACE_TARGET,
+            "--user", f"{ctx.uid}:{ctx.gid}", "--init", "--workdir", str(project.root),
             "--network", project.network, "--security-opt", "no-new-privileges",
             "--entrypoint", "sleep", *_label_args(labels),
         ]  # fmt: skip
@@ -326,9 +360,11 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
             args.append("--userns=keep-id")
         relabel = _selinux_relabel(ctx)
         for mount in plan.mounts:
-            args += mount.engine_args(relabel=relabel and mount.target == WORKSPACE_TARGET)
+            args += mount.engine_args(relabel=relabel and mount.target == str(project.root))
         for volume, rel in plan.volumes:
             args += VolumeMount(volume, str(PurePosixPath(image.home) / rel)).engine_args()
+        for volume, target in plan.isolated:
+            args += VolumeMount(volume, target).engine_args()
         args += [image.ref, "infinity"]
         engine.run(*args)
         created.append(("container", project.workspace_container))
@@ -342,12 +378,17 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
 
 
 def share_workspace(ctx: Context, plan: Plan, host_uid: int) -> int:
-    """ACLs for the sandbox user; git data is included only when it is mounted writable."""
+    """ACLs for the sandbox user; git data is included only when it is mounted writable.
+
+    Protected paths are mounted read-only and isolated ones are covered by volumes, so
+    neither needs (or, for a large virtualenv, should pay for) ACLs.
+    """
     if host_uid == os.getuid():
         return 0
+    skip = (PROJECT_DIR, *ctx.config.protected, *ctx.config.isolated)
     if ctx.git_mode != "rw":
-        return apply_acls(ctx.project.root, host_uid)
-    failed = apply_acls(ctx.project.root, host_uid, skip=(PROJECT_DIR,))
+        return apply_acls(ctx.project.root, host_uid, skip=(".git", *skip))
+    failed = apply_acls(ctx.project.root, host_uid, skip=skip)
     for git_dir in plan.layout.external_dirs:
         failed += apply_acls(git_dir, host_uid, skip=())
     return failed
@@ -362,6 +403,8 @@ def fix_state_ownership(ctx: Context, home: str) -> None:
             current /= part
             if str(current) not in paths:
                 paths.append(str(current))
+    # Only the volume roots: their parents are workspace directories owned by the host user.
+    paths += [str(ctx.project.root / rel) for rel in ctx.config.isolated]
     if not paths:
         return
     owner = f"{ctx.uid}:{ctx.gid}"
@@ -390,7 +433,7 @@ def ensure_ready(ctx: Context, *, unsafe_sockets: bool = False) -> None:
                 f"Container {project.workspace_container} belongs to {owner}, not to this "
                 "directory. Remove it with `agent-sandbox ls` / `agent-sandbox rm NAME`."
             )
-        plan = make_plan(ctx)
+        plan = make_plan(ctx, labels.get(LABEL_HOME))
         spec = compute_spec(ctx, plan, engine.image_id(ctx.config.image))
         if labels.get(LABEL_SPEC) != spec_hash(spec):
             try:
@@ -498,7 +541,8 @@ def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bo
     home = container_home(ctx)
     tty = sys.stdin.isatty() and sys.stdout.isatty()
     args = ["exec", "-i"] + (["-t"] if tty else [])
-    args += ["--user", "0" if root else f"{ctx.uid}:{ctx.gid}", "--workdir", WORKSPACE_TARGET]
+    args += ["--user", "0" if root else f"{ctx.uid}:{ctx.gid}"]
+    args += ["--workdir", str(ctx.project.root)]
     args += exec_env(ctx, home)
     if root:
         note = ROOT_NOTE_ROOTLESS if ctx.engine.rootless else ROOT_NOTE_ROOTFUL
