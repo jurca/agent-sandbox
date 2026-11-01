@@ -229,8 +229,18 @@ def apply_acls(
     dirs, files = _walk_for_acls(root, frozenset(skip))
     failed = 0
     dir_spec = f"u:{container_host_uid}:rwX,d:u:{container_host_uid}:rwX,d:u:{me}:rwX"
-    file_spec = f"u:{container_host_uid}:rwX"
-    for spec, paths in ((dir_spec, dirs), (file_spec, files)):
+    # Files get an explicit mask. Files created after the first run inherit the default
+    # entries above as `rwx` (masked to `rw-` at creation); letting setfacl recalculate the
+    # mask would then widen it to `rwx` and make them group-executable. `X` cannot decide
+    # either, as it reads the group bits, which are the (possibly already widened) mask.
+    # The owner's execute bit is the one that says whether a file is meant to run.
+    executable: list[str] = []
+    plain: list[str] = []
+    for path in files:
+        (executable if os.lstat(path).st_mode & stat.S_IXUSR else plain).append(path)
+    exec_spec = f"u:{container_host_uid}:rwx,m::rwx"
+    plain_spec = f"u:{container_host_uid}:rw-,m::rw-"
+    for spec, paths in ((dir_spec, dirs), (exec_spec, executable), (plain_spec, plain)):
         for batch in _batches(paths):
             result = subprocess.run(
                 ["setfacl", "-m", spec, "--", *batch], capture_output=True, text=True, check=False

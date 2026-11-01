@@ -207,6 +207,28 @@ def test_apply_acls_skips_git_and_config(repo: Path) -> None:
     assert str(other) not in acl(Path("/etc/hostname"))
 
 
+@needs_acl
+def test_apply_acls_again_keeps_files_not_executable(tmp_path: Path) -> None:
+    other = os.getuid() + 12345
+    script = tmp_path / "run.sh"
+    script.write_text("")
+    script.chmod(0o755)
+    assert mounts.apply_acls(tmp_path, other) == 0
+    # Created after the first run: inherits the directory's default entries as rwx.
+    (tmp_path / "README.md").write_text("")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "kb.md").write_text("")
+    assert mounts.apply_acls(tmp_path, other) == 0
+    for name in ("README.md", "docs/kb.md"):
+        assert (tmp_path / name).stat().st_mode & 0o111 == 0, name
+    assert (tmp_path / "run.sh").stat().st_mode & 0o110 == 0o110
+
+    # A mask already widened by an earlier version is narrowed again.
+    subprocess.run(["setfacl", "-m", "m::rwx", str(tmp_path / "README.md")], check=True)
+    assert mounts.apply_acls(tmp_path, other) == 0
+    assert (tmp_path / "README.md").stat().st_mode & 0o111 == 0
+
+
 def test_walk_for_acls_skips_relative_paths(tmp_path: Path) -> None:
     for rel in (".venv/lib", "backend/.venv/lib", "backend/src", "src"):
         (tmp_path / rel).mkdir(parents=True)
