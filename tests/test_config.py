@@ -25,7 +25,7 @@ def test_minimal_project_config_gets_defaults() -> None:
     assert cfg.env_set == {}
     assert cfg.mounts == []
     assert cfg.state_paths == list(DEFAULT_STATE_PATHS)
-    assert cfg.protected == [".claude", ".agents", ".vscode", ".idea"]
+    assert cfg.protected == [".claude", ".agents", ".vscode", ".idea", ".devcontainer"]
     assert cfg.isolated == [".venv", "node_modules"]
     assert cfg.proxy_base_image is None
 

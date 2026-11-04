@@ -19,7 +19,7 @@ APPROVED_FILES = (CONFIG_FILE, PROXY_CONF_FILE, ALLOW_BASE_FILE, ALLOW_EXTRA_FIL
 
 DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
 DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
-DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea")
+DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea", ".devcontainer")
 DEFAULT_ISOLATED = (".venv", "node_modules")
 DEFAULT_PROXY_BASE_IMAGE = "alpine:3"
 

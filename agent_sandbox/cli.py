@@ -94,7 +94,7 @@ approved last, including after a clone or pull.
   [env.set]        fixed variables; {{home}} expands to the container home directory
   [workspace] protected
                    workspace paths mounted read-only (default: .claude .agents .vscode
-                   .idea); missing ones are created empty
+                   .idea .devcontainer); missing ones are created empty
   [workspace] isolated
                    workspace paths replaced by a per-workspace volume, so the sandbox keeps
                    its own copy (default: .venv node_modules)

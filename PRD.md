@@ -20,7 +20,7 @@ Key properties:
 - Anything the agent writes that the host later **executes or trusts** is an escape route.
   Tracked files show up in `git diff`; gitignored ones do not. So configuration that host tools
   execute (`.claude/` hooks incl. the ignored `settings.local.json`, `.agents/`, `.vscode/`,
-  `.idea/`) is **protected** (read-only), and dependency trees the host runs (`.venv`,
+  `.idea/`, `.devcontainer/`) is **protected** (read-only), and dependency trees the host runs (`.venv`,
   `node_modules`) are **isolated**: the sandbox gets its own copy in a volume and never writes the
   host's.
 - What remains is **inescapable by design**: the agent's job is to write code that you then run.
@@ -153,7 +153,8 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### Project: `.agent-sandbox/` (committed)
 
 - `config.toml`: `image` (required), `harness` (default `bash`), `[env] pass`/`[env.set]`,
-  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`), `[workspace]
+  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`,
+  `.devcontainer`), `[workspace]
   isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target` defaulting to
   `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
   `.cache/pre-commit`), `[proxy] base_image`. Unknown keys are errors.

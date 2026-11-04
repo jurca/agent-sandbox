@@ -313,14 +313,14 @@ def test_protected_paths_are_read_only_and_isolated_paths_are_separate(
 ) -> None:
     (workspace / ".venv" / "host-marker").write_text("host venv")
     script = (
-        "for p in .claude/settings.local.json .agents/x .vscode/x .idea/x;"
+        "for p in .claude/settings.local.json .agents/x .vscode/x .idea/x .devcontainer/x;"
         ' do if touch "$p" 2>/dev/null; then echo "writable $p"; fi; done;'
         " ls -A .venv | grep -c host-marker;"
         " stat -c %u .venv node_modules; touch .venv/made-inside && echo venv-writable"
     )
     uid = str(os.getuid())
     assert sh(env, workspace, script).split() == ["0", uid, uid, "venv-writable"]
-    for rel in (".claude", ".agents", ".vscode", ".idea"):
+    for rel in (".claude", ".agents", ".vscode", ".idea", ".devcontainer"):
         assert (workspace / rel).is_dir() and not any((workspace / rel).iterdir())
     assert not (workspace / ".venv" / "made-inside").exists()
     ok(env, workspace, "recreate")

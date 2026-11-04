@@ -26,7 +26,7 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 [workspace]
 # Read-only inside the sandbox: configuration that tools on the host execute or trust.
 # A missing path is created as an empty directory, so the agent cannot create it either.
-protected = [".claude", ".agents", ".vscode", ".idea"]
+protected = [".claude", ".agents", ".vscode", ".idea", ".devcontainer"]
 # Replaced by a volume of this workspace: the sandbox builds its own copy (virtualenv,
 # node_modules) and never writes the one the host runs.
 isolated = [".venv", "node_modules"]

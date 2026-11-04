@@ -10,7 +10,14 @@ from pathlib import Path
 import pytest
 
 from agent_sandbox import manage, sandbox, util
-from agent_sandbox.config import MountSpec, ProjectConfig, UserConfig, load_project_config
+from agent_sandbox.config import (
+    DEFAULT_ISOLATED,
+    DEFAULT_PROTECTED,
+    MountSpec,
+    ProjectConfig,
+    UserConfig,
+    load_project_config,
+)
 from agent_sandbox.engine import EngineError
 from agent_sandbox.images import UserImage
 from agent_sandbox.mounts import BindMount
@@ -28,6 +35,10 @@ from .conftest import git
 from .fakes import FakeEngine
 
 IMAGE = "example/dev:1"
+
+
+# Workspace paths that are mounted over by default (protected, isolated, toolkit config).
+COVERED = (".agent-sandbox", *DEFAULT_PROTECTED, *DEFAULT_ISOLATED)
 
 
 def make_ctx(
@@ -64,7 +75,7 @@ def test_plan_for_plain_clone(configured: Path) -> None:
         BindMount(f"{ws}/.git", f"{ws}/.git", readonly=True),
         BindMount(f"{ws}/.agent-sandbox", f"{ws}/.agent-sandbox", readonly=True),
         *(BindMount(f"{ws}/{rel}", f"{ws}/{rel}") for rel in (".claude", ".agents", ".vscode",
-                                                                ".idea")),
+                                                                ".idea", ".devcontainer")),
     ]  # fmt: skip
     p = project_for(configured)
     assert plan.volumes == [
@@ -339,12 +350,11 @@ def test_share_workspace_includes_git_only_when_rw(
     assert sandbox.share_workspace(ctx, make_plan(ctx), os.getuid()) == 0
     assert calls == []  # same uid inside and outside: nothing to share
     sandbox.share_workspace(ctx, make_plan(ctx), 100999)
-    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
-    assert calls == [(tree.resolve(), (".git", *covered))]
+    assert calls == [(tree.resolve(), (".git", *COVERED))]
     calls.clear()
     rw = make_ctx(tree.resolve(), user=UserConfig(git="rw"))
     sandbox.share_workspace(rw, make_plan(rw), 100999)
-    assert calls == [(tree.resolve(), covered), (repo / ".git", ())]
+    assert calls == [(tree.resolve(), COVERED), (repo / ".git", ())]
 
 
 def test_proxy_is_unprivileged_and_configured_before_start(configured: Path) -> None:
@@ -417,8 +427,7 @@ def test_reclaim_hands_sandbox_files_back_to_the_host_user(
     engine = reclaim_engine(ctx, "0 0", lambda paths: "".join(f"{p}\n" for p in paths))
     assert sandbox.reclaim_workspace(ctx, make_plan(ctx)) == (2, 0)
     reference = (configured / ".agent-sandbox").lstat()
-    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
-    assert walks[0] == (configured, frozenset((".git", *covered)), os.getuid(), reference.st_gid)
+    assert walks[0] == (configured, frozenset((".git", *COVERED)), os.getuid(), reference.st_gid)
     stat_call = ("exec", ctx.project.workspace_container, "stat", "-c", "%u %g",
                  str(configured / ".agent-sandbox"))  # fmt: skip
     assert stat_call in engine.calls
@@ -491,5 +500,4 @@ def test_reclaim_covers_git_dirs_only_when_rw(
     rw = make_ctx(tree.resolve(), user=UserConfig(git="rw"))
     reclaim_engine(rw, "0 0", lambda paths: "")
     sandbox.reclaim_workspace(rw, make_plan(rw))
-    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
-    assert roots == [(tree.resolve(), frozenset(covered)), (repo / ".git", frozenset())]
+    assert roots == [(tree.resolve(), frozenset(COVERED)), (repo / ".git", frozenset())]
