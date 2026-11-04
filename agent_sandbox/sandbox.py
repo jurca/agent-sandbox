@@ -51,6 +51,9 @@ from .proxy import PROXY_ALIAS, PROXY_PORT, PROXY_UID
 from .util import SandboxError, eprint, require_phrase, runtime_dir
 
 SPEC_VERSION = 2
+# Engines keep the writable layer across stop/start; a tmpfs gives every start an empty /tmp.
+# `exec` because Podman defaults to `noexec`; no `size=` (the kernel default is half of RAM).
+TMP_TMPFS = "/tmp:rw,exec,nosuid,nodev,mode=1777"
 PROXY_URL = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
 ROOT_ACK_PHRASE = "I understand the risks"
 STOP_TIMEOUT = "3"
@@ -181,6 +184,7 @@ def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, obj
         "state": [[name, rel] for name, rel in plan.volumes],
         "isolated": [[name, target] for name, target in plan.isolated],
         "network": ctx.project.network,
+        "tmp": "tmpfs",
     }
 
 
@@ -354,7 +358,7 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
             "create", "--name", project.workspace_container, "--hostname", project.hostname,
             "--user", f"{ctx.uid}:{ctx.gid}", "--init", "--workdir", str(project.root),
             "--network", project.network, "--security-opt", "no-new-privileges",
-            "--entrypoint", "sleep", *_label_args(labels),
+            "--tmpfs", TMP_TMPFS, "--entrypoint", "sleep", *_label_args(labels),
         ]  # fmt: skip
         if plan.ownership == "keep-id":
             args.append("--userns=keep-id")

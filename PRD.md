@@ -90,7 +90,9 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
   - for linked worktrees/submodules the git common dir (and per-worktree dir if outside it) ro at
     its identical host path;
   - extra read-only mounts from config (`~` in the target is the container home);
-  - state volumes under the container home.
+  - state volumes under the container home;
+  - a fresh tmpfs on `/tmp` (`rw,exec,nosuid,nodev,mode=1777`, no size cap), so `/tmp` starts
+    empty on every start like on a rebooted host. `/var/tmp` stays on the container's disk.
 - `git = "rw"` (writable `.git` and external git dirs) is a user-level-only opt-in.
 - Mirroring the host path keeps absolute paths meaningful on both sides: tool output and
   tracebacks are clickable on the host, caches and editable installs (`.pth`) agree, worktree
@@ -291,7 +293,8 @@ creation rolls back what it created on failure; at most one network session per 
   `CONNECT`/`GET` through `/dev/tcp/proxy/8888`, `net` expiry/extend/stop/SIGKILL, allow-all, promotion,
   approval, drift/recreate, sockets, rm/ls/prune, clone, linked worktree, shared state volume, derived
   image on Alpine, host-path working directory, protected paths read-only and created empty on the
-  host, isolated volumes hiding the host copy, owned by the user and surviving `recreate`.
+  host, isolated volumes hiding the host copy, owned by the user and surviving `recreate`, `/tmp`
+  emptied by `stop` while `/var/tmp` survives, `/tmp` executable.
 - Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
@@ -316,6 +319,13 @@ creation rolls back what it created on failure; at most one network session per 
 - **Per-project namespacing inside shared state volumes**: not done. Mirroring the workspace path
   already separates per-project state of harnesses that key by working directory, and
   namespacing would defeat sharing (logins, pre-commit environments).
+- **`/tmp` as tmpfs**: the engines keep the container's writable layer across stop/start, so
+  without it `/tmp` kept stale sockets, locks and temp files until `recreate`. It is mounted `exec`
+  (Podman defaults to `noexec`, which breaks build steps and compiled test binaries) and without a
+  `size=` cap (the kernel default is half of RAM): with no memory limit, large temp files cost
+  host RAM/swap, which is accepted over builds failing on a cap; `/var/tmp` remains on disk. Wiping
+  `/tmp` at start instead was rejected: a workspace under `/tmp` is bind-mounted there and would be
+  deleted.
 - **Protecting `.claude/` costs** Claude Code the ability to persist "always allow" answers in
   `settings.local.json` and the agent the ability to write project skills/commands directly; it
   drafts them elsewhere and the user promotes them. A project can drop entries from `protected`.

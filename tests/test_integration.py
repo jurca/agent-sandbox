@@ -35,7 +35,7 @@ from .conftest import git, make_repo
 pytestmark = pytest.mark.integration
 
 LAUNCHER = str(Path(__file__).resolve().parent.parent / "agent-sandbox")
-IMAGE = os.environ.get("ASB_TEST_IMAGE", "mcr.microsoft.com/vscode/devcontainers/python:3.14")
+IMAGE = os.environ.get("ASB_TEST_IMAGE", "python:3.14")
 ENGINE = os.environ.get("ASB_TEST_ENGINE", "docker")
 
 PROBE = r"""
@@ -340,6 +340,19 @@ def test_state_dirs_belong_to_the_user_and_survive_recreate(env: Env, scratch: P
     assert sh(env, scratch, 'cat "$HOME/.claude/marker"') == "kept\n"
     ok(env, scratch, "rm", "--state")
     assert sh(env, scratch, 'cat "$HOME/.claude/marker" 2>/dev/null || echo gone') == "gone\n"
+
+
+def test_tmp_is_a_fresh_executable_tmpfs_on_every_start(env: Env, scratch: Path) -> None:
+    script = (
+        "awk '$2 == \"/tmp\" { print $3 }' /proc/mounts;"
+        " echo gone > /tmp/marker; echo kept > /var/tmp/marker;"
+        " printf '#!/bin/sh\\necho ran\\n' > /tmp/run.sh && chmod +x /tmp/run.sh && /tmp/run.sh"
+    )
+    assert sh(env, scratch, script) == "tmpfs\nran\n"
+    assert "Stopped:" in ok(env, scratch, "stop").out
+    # Only the workspace's mount point remains (the scratch repo lives under /tmp/asb-it-*).
+    out = sh(env, scratch, "ls -A /tmp; stat -c %a /tmp; cat /var/tmp/marker")
+    assert out == f"{env.base.name}\n1777\nkept\n"  # /var/tmp keeps its contents
 
 
 def test_proxy_is_unprivileged_without_host_mounts(env: Env, workspace: Path) -> None:

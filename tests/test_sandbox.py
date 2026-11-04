@@ -148,6 +148,8 @@ def test_spec_hash_and_differences(configured: Path) -> None:
     assert spec_differences(spec, changed) == ["base_id", "git", "mounts"]
     assert spec_hash(spec) != spec_hash(changed)
     assert compute_spec(ctx, plan, None)["base_id"] == "missing"
+    assert spec["tmp"] == "tmpfs"  # sandboxes created before the /tmp tmpfs drift
+    assert spec_differences({k: v for k, v in spec.items() if k != "tmp"}, spec) == ["tmp"]
 
 
 def test_command_with_umask() -> None:
