@@ -78,6 +78,13 @@ def test_user_dockerfile_uses_base_and_appends_passwd() -> None:
     assert "useradd" not in text and "adduser" not in text
 
 
+def test_project_tag_keeps_the_whole_id() -> None:
+    project_id = "a-very-long-project-directory-name-indeed-x-1a2b3c4d"
+    assert images.project_tag("Martin", project_id, "extended", "abc") == (
+        f"localhost/agent-sandbox/martin-{project_id}-extended:abc"
+    )
+
+
 def test_proxy_image_tag_depends_on_base() -> None:
     a, b = images.proxy_image_tag("alpine:3"), images.proxy_image_tag("mirror/alpine:3")
     assert a != b and a == images.proxy_image_tag("alpine:3")
@@ -96,3 +103,11 @@ def test_ensure_user_image_refuses_root_and_odd_names() -> None:
         images.ensure_user_image(engine, "x", user="root", uid=0, gid=0, group="root")
     with pytest.raises(SandboxError, match="odd names"):
         images.ensure_user_image(engine, "x", user="Bad User", uid=1000, gid=1000, group="g")
+
+
+def test_ensure_user_image_refuses_odd_remote_user() -> None:
+    engine = images.Engine("docker", rootless=True)
+    with pytest.raises(SandboxError, match="odd name"):
+        images.ensure_user_image(
+            engine, "b", user="dev", uid=1000, gid=1000, group="dev", remote_user="Bad Name"
+        )

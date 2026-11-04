@@ -7,10 +7,10 @@ import os
 import sys
 from pathlib import Path
 
-from . import manage
+from . import approval, manage, setup
 from .config import CONFIG_FILE, PROJECT_DIR, load_user_config
 from .engine import Engine, detect_engine
-from .images import ensure_proxy_image, ensure_user_image
+from .images import ensure_proxy_image
 from .net import run_net, stop_net
 from .project import NotARepositoryError, Project, find_project, git_toplevel
 from .sandbox import (
@@ -20,12 +20,13 @@ from .sandbox import (
     remove_by_id,
     run_in_container,
     stop_sandbox,
+    workspace_image,
 )
 from .util import SandboxError, eprint, parse_duration
 
 UNSAFE_FLAG = "--unsafely-mount-dirs-with-sockets"
 COMMANDS = (
-    "init", "exec", "root", "net", "stop", "rm", "recreate", "rebuild", "ls", "prune",
+    "init", "exec", "root", "net", "setup", "stop", "rm", "recreate", "rebuild", "ls", "prune",
     "status", "doctor", "repair",
 )  # fmt: skip
 
@@ -40,7 +41,8 @@ container sits on an internal network with no route out; its only way out is a t
 container that allows a short list of hosts.
 
 USAGE
-  agent-sandbox                     Create the sandbox if needed, start it, run the harness.
+  agent-sandbox                     Create the sandbox if needed, start it, run the setup
+                                    commands that have not run yet, then the harness.
                                     Run it at the root of a git repository.
   agent-sandbox [--image IMAGE] URL [DIR]
                                     Outside a repository: clone URL, then do the same. With
@@ -52,25 +54,26 @@ COMMANDS
   root                              Root shell, for installing packages. Not for harnesses.
   net DURATION [--allow HOST]... [--allow-all] [--extend]
   net --stop                        Open the network for a limited time (see `help network`).
+  setup                             Run the setup commands again (see `help setup`).
   stop                              Stop the sandbox and its proxy.
   rm [NAME] [--state]               Remove containers and network (workspace files are never
                                     touched). --state also deletes the harness state and
                                     isolated volumes.
   recreate                          Remove and create the containers again (keeps state).
-  rebuild [--pull]                  Rebuild the derived workspace image and the proxy image.
+  rebuild [--pull]                  Rebuild the workspace image (all layers) and the proxy image.
   ls                                List sandboxes of all engines; orphaned ones are flagged.
   prune [--keep-state]              Remove orphaned sandboxes, asking about each one.
   status                            Show state, approval and configuration drift.
   doctor                            Check isolation of a running sandbox.
   repair                            Reclaim sandbox-owned files, re-apply access.
-  help [config|network|security|COMMAND]
+  help [config|setup|network|security|COMMAND]
 
 OPTIONS
   {UNSAFE_FLAG}
                                     Allow mounting directories that contain unix sockets
                                     (asks you to type a confirmation phrase).
 
-More: `agent-sandbox help config`, `help network`, `help security`.
+More: `agent-sandbox help config`, `help setup`, `help network`, `help security`.
 """
 
 HELP_CONFIG = f"""\
@@ -80,15 +83,23 @@ Project: {PROJECT_DIR}/ at the repository root. Commit it. It is mounted read-on
 sandbox, and the host asks you to approve it (showing a diff) whenever it differs from what you
 approved last, including after a clone or pull.
 
-  {CONFIG_FILE}      image, harness, environment, workspace paths, extra mounts, state
+  {CONFIG_FILE}      image, harness, environment, workspace paths, extra mounts, state, setup
   tinyproxy.conf   static tinyproxy settings (Timeout, ConnectPort, ...); agent-sandbox
                    generates the rest and rejects those directives here
   allow.base       hosts reachable whenever the sandbox runs (model APIs, login)
-  allow.extra      hosts reachable only during `agent-sandbox net`
+  allow.extra      hosts reachable only during `agent-sandbox net` and the setup
+  Dockerfile       optional: built on top of the workspace image (see `help setup`)
+Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it), and with
+[devcontainer] enabled the whole .devcontainer/ directory too.
 
 {CONFIG_FILE} keys
   image            base image; a derived image with your user (same uid, gid, name) is built
-                   automatically when the base lacks that uid
+                   automatically when the base lacks that uid. Pin it by digest
+                   (image@sha256:...) to review changes; otherwise it warns.
+  [devcontainer] enabled = true
+                   instead of `image`: build the base from the project's devcontainer
+                   (see `help setup`); config = ".devcontainer/<name>/devcontainer.json"
+                   picks another one than .devcontainer/devcontainer.json
   harness          command line started by a plain `agent-sandbox`
   [env] pass       host variables to pass into the container (when set)
   [env.set]        fixed variables; {{home}} expands to the container home directory
@@ -103,6 +114,9 @@ approved last, including after a clone or pull.
   [state] paths    directories under the container home kept in a volume
                    (per workspace by default; default: .claude .copilot .cache/pre-commit)
   [proxy] base_image   image tinyproxy is installed on (default: alpine:3)
+  [setup] create   shell commands run once per container before the first harness start,
+                   with allow.extra reachable (e.g. "uv sync", "pre-commit install-hooks")
+  [setup] start    shell commands run once per container start (base allowlist only)
 
 Allowlist syntax (allow.base, allow.extra, --allow)
   example.com      exactly that host
@@ -117,9 +131,56 @@ User-level configuration: ~/.config/agent-sandbox/config.toml (never in the repo
   state_volume = "per-workspace" | "NAME"    "NAME" shares harness logins between workspaces
   [workspaces."/abs/path"]                   per-workspace overrides of git and state_volume
   [proxy] base_image = "..."
+  devcontainer_cli = ["devcontainer"]        how to run the devcontainers CLI, for example
+                                             ["npx", "@devcontainers/cli"]
 
 Environment overrides: AGENT_SANDBOX_CONFIG_DIR, AGENT_SANDBOX_STATE_DIR,
 AGENT_SANDBOX_RUNTIME_DIR, AGENT_SANDBOX_ALLOW_ROOTFUL=1.
+"""
+
+HELP_SETUP = f"""\
+SETUP
+
+Two layers prepare the sandbox. What needs root (packages, tools, CA certificates, dotfiles)
+belongs in the image: it is built once and survives `recreate`. What needs the workspace
+(`uv sync`, `pre-commit install-hooks`) runs in the container as you.
+
+Image layers, bottom to top
+  base             `image`, or the devcontainer build ([devcontainer] enabled = true)
+  user             your uid; an existing user with it is used, a devcontainer's remoteUser
+                   is given it (keeping its name), otherwise your user is added
+  {PROJECT_DIR}/Dockerfile
+                   optional, built with {PROJECT_DIR}/ as the context (never the workspace).
+                   It must start with `ARG base` and `FROM $base` and gets the build args
+                   user, uid, gid and home. Builds are not proxied; they only use approved files.
+  Changing any of them makes the container differ from its configuration: run `recreate`.
+
+Setup commands
+  create           [setup] create, then the devcontainer's onCreateCommand,
+                   updateContentCommand and postCreateCommand (Features first). They run once
+                   per container, before the first harness start, through the proxy with
+                   allow.extra open while they run. Hosts that were blocked are listed and can
+                   be added to allow.extra; then you can retry. Until they all succeed the
+                   harness is not started (`exec` and `root` still work); `agent-sandbox setup`
+                   runs them again, so they should be idempotent.
+  start            [setup] start and postStartCommand: once per container start.
+  attach           postAttachCommand: before each harness start.
+  start and attach use the base allowlist (a harness may be running) and only warn on failure.
+  Each command is its own process: a string runs with `sh -c`, so `export` or `cd` in it does
+  not reach the harness.
+
+Devcontainer (opt-in: [devcontainer] enabled = true instead of `image`)
+  The devcontainers CLI (`devcontainer_cli` in the user config) only builds the image, with
+  --frozen-lockfile: create the lockfile on the host with
+      devcontainer upgrade --workspace-folder . --config .devcontainer/devcontainer.json
+  and commit it; when it is outdated, compare with `--dry-run` first. The configuration must be
+  in .devcontainer/ (protected, approved as a whole); a .devcontainer.json in the workspace
+  root, a Dockerfile or a local Feature outside .devcontainer/ are refused.
+  Applied: containerEnv (image), remoteEnv (exec environment; [env] wins), remoteUser, the
+  lifecycle commands. Not applied, with a warning: initializeCommand, runArgs, workspaceMount,
+  appPort, privileged, capAdd, securityOpt, mounts and Feature entrypoints (so for example
+  docker-in-docker installs but cannot run). Docker Compose configurations are refused.
+  ${{localEnv:NAME}} only reads variables listed in [env] pass.
 """
 
 HELP_NETWORK = """\
@@ -215,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extend", action="store_true", help="add time to the running session")
     p.add_argument("--stop", action="store_true", help="end the running session now")
 
+    add("setup", "Run the setup commands again.", unsafe=True)
     add("stop", "Stop the sandbox and its proxy.")
     p = add("rm", "Remove the sandbox containers and network.")
     p.add_argument("name", nargs="?", help="sandbox id from `ls` (default: this directory)")
@@ -271,6 +333,7 @@ def _default(argv: list[str]) -> int:
         project = find_project(cwd)
     ctx = build_context(project)
     ensure_ready(ctx, unsafe_sockets=args.unsafe)
+    setup.before_harness(ctx)
     run_in_container(ctx)
     return 0
 
@@ -318,10 +381,9 @@ def _cmd_recreate(args: argparse.Namespace) -> int:
 
 def _cmd_rebuild(args: argparse.Namespace) -> int:
     ctx = build_context(find_project(Path.cwd()))
-    image = ensure_user_image(
-        ctx.engine, ctx.config.image, user=ctx.username, uid=ctx.uid, gid=ctx.gid,
-        group=ctx.groupname, rebuild=True, pull=args.pull,
-    )  # fmt: skip
+    with project_lock(ctx.project):
+        approval.ensure_approved(ctx.project)  # the build reads the Dockerfile, .devcontainer/
+    image = workspace_image(ctx, rebuild=True, pull=args.pull)
     ensure_proxy_image(ctx.engine, ctx.proxy_base_image, rebuild=True)
     kind = "derived image" if image.derived else "base image (no derived image needed)"
     eprint(
@@ -339,6 +401,7 @@ def _dispatch(argv: list[str]) -> int:
         texts = {
             "": OVERVIEW,
             "config": HELP_CONFIG,
+            "setup": HELP_SETUP,
             "network": HELP_NETWORK,
             "security": HELP_SECURITY,
         }
@@ -375,6 +438,12 @@ def _dispatch(argv: list[str]) -> int:
         return 0
     if cmd == "net":
         return _cmd_net(args)
+    if cmd == "setup":
+        ctx = build_context(find_project(Path.cwd()))
+        ensure_ready(ctx, unsafe_sockets=args.unsafe)
+        setup.ensure_setup(ctx, force=True)
+        eprint("Setup finished.")
+        return 0
     if cmd == "stop":
         engine, project = _engine_and_project()
         stopped = stop_sandbox(engine, project)

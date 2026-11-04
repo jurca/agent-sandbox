@@ -56,7 +56,30 @@ def test_full_project_config() -> None:
     ("data", "message"),
     [
         ({}, "`image` is required"),
-        ({"image": "  "}, "`image` is required"),
+        ({"image": "  "}, "non-empty string"),
+        ({"image": "i", "devcontainer": {"enabled": True}}, "not both"),
+        ({"devcontainer": {"enabled": False}}, "`image` is required"),
+        ({"devcontainer": {"enabled": "yes"}}, "true or false"),
+        ({"devcontainer": {"config": ".devcontainer/x/devcontainer.json"}}, "needs `enabled"),
+        ({"devcontainer": {"enabled": True, "build": True}}, "unknown key"),
+        ({"devcontainer": {"enabled": True, "config": ".devcontainer.json"}}, "must be"),
+        ({"devcontainer": {"enabled": True, "config": "dc/devcontainer.json"}}, "must be"),
+        (
+            {"devcontainer": {"enabled": True, "config": ".devcontainer/a/b/devcontainer.json"}},
+            "must be",
+        ),
+        (
+            {"devcontainer": {"enabled": True, "config": ".devcontainer/../devcontainer.json"}},
+            "must be",
+        ),
+        ({"devcontainer": {"enabled": True, "config": ".devcontainer/x/other.json"}}, "must be"),
+        (
+            {"devcontainer": {"enabled": True}, "workspace": {"isolated": [".devcontainer/x"]}},
+            "both",
+        ),
+        ({"image": "i", "setup": {"create": "uv sync"}}, "list of strings"),
+        ({"image": "i", "setup": {"start": [" "]}}, "must not be empty"),
+        ({"image": "i", "setup": {"stop": []}}, "unknown key"),
         ({"image": "i", "colour": "red"}, "unknown key"),
         ({"image": "i", "harness": ""}, "harness"),
         ({"image": "i", "env": []}, r"\[env\] must be a table"),
@@ -93,6 +116,42 @@ def test_full_project_config() -> None:
 def test_project_config_errors(data: dict[str, Any], message: str) -> None:
     with pytest.raises(SandboxError, match=message):
         parse_project_config(data)
+
+
+def test_devcontainer_config() -> None:
+    cfg = parse_project_config({"devcontainer": {"enabled": True}})
+    assert (cfg.image, cfg.devcontainer) == (None, ".devcontainer/devcontainer.json")
+    named = {"enabled": True, "config": "./.devcontainer/py/devcontainer.json"}
+    assert parse_project_config({"devcontainer": named}).devcontainer == (
+        ".devcontainer/py/devcontainer.json"
+    )
+
+
+def test_devcontainer_dir_is_always_protected_when_used() -> None:
+    cfg = parse_project_config(
+        {"devcontainer": {"enabled": True}, "workspace": {"protected": [".claude"]}}
+    )
+    assert cfg.protected == [".claude", ".devcontainer"]
+    plain = parse_project_config({"image": "i", "workspace": {"protected": [".claude"]}})
+    assert plain.protected == [".claude"]
+
+
+def test_setup_commands() -> None:
+    cfg = parse_project_config(
+        {"image": "i", "setup": {"create": ["uv sync", "pre-commit install-hooks"], "start": ["x"]}}
+    )
+    assert cfg.setup_create == ["uv sync", "pre-commit install-hooks"]
+    assert cfg.setup_start == ["x"]
+    assert parse_project_config({"image": "i"}).setup_create == []
+
+
+def test_user_config_devcontainer_cli() -> None:
+    assert parse_user_config({}).devcontainer_cli == ["devcontainer"]
+    cfg = parse_user_config({"devcontainer_cli": ["npx", "@devcontainers/cli"]})
+    assert cfg.devcontainer_cli == ["npx", "@devcontainers/cli"]
+    for bad in ([], [""], "devcontainer"):
+        with pytest.raises(SandboxError, match="devcontainer_cli"):
+            parse_user_config({"devcontainer_cli": bad})
 
 
 def test_init_template_parses_and_escapes() -> None:

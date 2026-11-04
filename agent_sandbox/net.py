@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -11,6 +12,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -29,6 +31,10 @@ WARNING: --allow-all lets the sandbox reach ANY host on the internet for the who
 Use it for surveys and first-time setup, not for unattended work."""
 
 SPINNER = "|/-\\"
+# The net tier opened for setup is a lease, renewed while setup runs: a killed CLI leaves it
+# open for at most this long.
+SETUP_LEASE = 300
+SETUP_RENEW = 60
 HOURGLASS = ("⏳", "⌛")
 
 
@@ -220,6 +226,73 @@ def run_net(
             raise SandboxError("The proxy did not switch to the network tier in time.")
         _pid_path(ctx).write_text(str(os.getpid()))
     return _watch(ctx, entries, session, total=deadline - now, since=now)
+
+
+@contextlib.contextmanager
+def setup_network(ctx: Context) -> Generator[Observed]:
+    """The net tier (base + allow.extra) while the setup's create phase runs.
+
+    An active `net` session is used as it is (and left running). Otherwise a lease is opened and
+    renewed; at the end it is closed unless someone else changed the deadline meanwhile (`net
+    --extend` or `--stop`). Blocked hosts are reported live and collected in the result.
+    """
+    project, engine = ctx.project, ctx.engine
+    lease: float | None = None
+    with project_lock(project):
+        _require_running_proxy(ctx)
+        if proxyctl.active_deadline(project) is None:
+            subnet = engine.network_subnet(project.network)
+            entries = proxyctl.write_net_tier(engine, project, subnet, [], allow_all=False)
+            _save_session(ctx, NetSession())
+            lease = float(int(time.time()) + SETUP_LEASE)  # stored in whole seconds
+            proxyctl.write_deadline(engine, project, lease)
+            if not proxyctl.wait_for_state(engine, project, "net"):
+                proxyctl.clear_deadline(engine, project)
+                raise SandboxError("The proxy did not switch to the network tier in time.")
+            _pid_path(ctx).write_text(str(os.getpid()))
+            allow_all = False
+        else:
+            session = _load_session(ctx)
+            base, extra = proxyctl.read_allowlists(project)
+            entries = proxy.merge_entries(base, extra, session.hosts)
+            allow_all = session.allow_all
+    log = LogTail(proxyctl.follow_log(engine, project, time.time()))
+    observed = Observed(entries, allow_all, no_proxy=proxy.read_proxy_env(os.environ).no_proxy)
+    stop = threading.Event()
+
+    def report() -> None:
+        for event in log.poll():
+            if message := observed.add(event):
+                eprint(f"agent-sandbox: {message}")
+
+    def background() -> None:
+        nonlocal lease
+        last_renewal = time.monotonic()
+        while not stop.wait(0.5):
+            report()
+            if lease is None or time.monotonic() - last_renewal < SETUP_RENEW:
+                continue
+            last_renewal = time.monotonic()
+            if proxyctl.read_deadline(project) != lease:
+                lease = None  # taken over by `net`: leave it alone
+                continue
+            lease = float(int(time.time()) + SETUP_LEASE)  # stored in whole seconds
+            proxyctl.write_deadline(engine, project, lease)
+
+    thread = threading.Thread(target=background, daemon=True)
+    thread.start()
+    try:
+        yield observed
+    finally:
+        stop.set()
+        thread.join()
+        if lease is not None and proxyctl.read_deadline(project) == lease:
+            proxyctl.clear_deadline(engine, project)
+            _pid_path(ctx).unlink(missing_ok=True)
+            proxyctl.wait_for_state(engine, project, "base")
+        time.sleep(0.5)  # let the last log lines arrive
+        report()
+        log.close()
 
 
 def _install_signal_handlers() -> None:

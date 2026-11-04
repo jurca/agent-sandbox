@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import approval, proxyctl, templates
+from . import approval, proxyctl, setup, templates
 from .config import (
     ALLOW_BASE_FILE,
     ALLOW_EXTRA_FILE,
@@ -37,6 +37,7 @@ from .project import (
 from .proxy import PROXY_UID
 from .sandbox import (
     Context,
+    base_ref,
     compute_spec,
     container_home,
     fix_state_ownership,
@@ -221,7 +222,10 @@ def status(ctx: Context) -> None:
     print(f"workspace:  {project.root}")
     print(f"id:         {project.id}")
     print(f"engine:     {engine.mode}")
-    print(f"image:      {ctx.config.image}")
+    if ctx.config.devcontainer is not None:
+        print(f"image:      devcontainer {ctx.config.devcontainer} ({base_ref(ctx)})")
+    else:
+        print(f"image:      {ctx.config.image}")
     print(
         f"config:     {'approved' if approval.is_approved(project) else 'NOT approved (will ask)'}"
     )
@@ -240,7 +244,7 @@ def status(ctx: Context) -> None:
         labels = (info.get("Config") or {}).get("Labels") or {}
         try:
             plan = make_plan(ctx, labels.get(LABEL_HOME))
-            current = spec_hash(compute_spec(ctx, plan, engine.image_id(ctx.config.image)))
+            current = spec_hash(compute_spec(ctx, plan, engine.image_id(base_ref(ctx))))
             drift = (
                 "matches the configuration"
                 if labels.get(LABEL_SPEC) == current
@@ -249,6 +253,9 @@ def status(ctx: Context) -> None:
         except SandboxError as exc:
             drift = f"cannot be checked ({exc})"
         print(f"container:  {drift}")
+        current = setup.session(ctx)
+        done = setup.create_done(ctx, current, setup.plan_for(ctx, current))
+        print(f"setup:      {'done' if done else 'pending (runs before the next harness start)'}")
 
 
 # --- doctor -----------------------------------------------------------------------------

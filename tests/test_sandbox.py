@@ -501,3 +501,113 @@ def test_reclaim_covers_git_dirs_only_when_rw(
     reclaim_engine(rw, "0 0", lambda paths: "")
     sandbox.reclaim_workspace(rw, make_plan(rw))
     assert roots == [(tree.resolve(), frozenset(COVERED)), (repo / ".git", frozenset())]
+
+
+# --- the workspace image ----------------------------------------------------------------
+
+
+def test_spec_is_unchanged_without_a_dockerfile(configured: Path) -> None:
+    """Containers created before the image layers existed keep matching their configuration."""
+    ctx = make_ctx(configured)
+    spec = compute_spec(ctx, make_plan(ctx), "sha256:base")
+    assert "dockerfile" not in spec and spec["base_ref"] == IMAGE
+    (configured / ".agent-sandbox" / "Dockerfile").write_text("ARG base\nFROM $base\n")
+    first = compute_spec(ctx, make_plan(ctx), "sha256:base")["dockerfile"]
+    (configured / ".agent-sandbox" / "ca.crt").write_text("CERT")  # may be copied in
+    assert compute_spec(ctx, make_plan(ctx), "sha256:base")["dockerfile"] != first
+    with_toolkit_change = sandbox.extension_digest(ctx)
+    (configured / ".agent-sandbox" / "allow.extra").write_text("pypi.org\n")
+    assert sandbox.extension_digest(ctx) == with_toolkit_change  # never affects the image
+
+
+def test_workspace_image_from_image_warns_when_unpinned(
+    configured: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_user_image(engine: object, ref: str, **kwargs: object) -> UserImage:
+        seen.update(kwargs, ref=ref)
+        return fake_image()
+
+    monkeypatch.setattr(sandbox, "ensure_user_image", fake_user_image)
+    ctx = make_ctx(configured)
+    assert sandbox.workspace_image(ctx).ref == IMAGE
+    assert seen["ref"] == IMAGE and seen["remote_user"] is None and seen["tag"] is None
+    assert "example/dev:1 is not pinned by digest" in capsys.readouterr().err
+    ctx.config.image = "example/dev@sha256:abc"
+    sandbox.workspace_image(ctx)
+    assert "not pinned" not in capsys.readouterr().err
+
+
+def test_workspace_image_from_devcontainer_adapts_its_user(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    tag = "localhost/agent-sandbox/dev-x-devcontainer:abc"
+    metadata = [{"id": "f"}, {"remoteUser": "vscode"}]
+    engine.add("image", tag, {"devcontainer.metadata": json.dumps(metadata)}, Id="sha256:dc")
+    monkeypatch.setattr(sandbox.devcontainer, "ensure_image", lambda *a, **k: tag)
+    seen: dict[str, object] = {}
+
+    def fake_user_image(engine: object, ref: str, **kwargs: object) -> UserImage:
+        seen.update(kwargs, ref=ref)
+        return fake_image()
+
+    monkeypatch.setattr(sandbox, "ensure_user_image", fake_user_image)
+    config = ProjectConfig(devcontainer=".devcontainer/devcontainer.json")
+    ctx = make_ctx(configured, engine, config=config)
+    sandbox.workspace_image(ctx, pull=True)
+    assert seen == {
+        "ref": tag, "user": "dev", "uid": 1000, "gid": 1000, "group": "dev",
+        "rebuild": False, "pull": False, "remote_user": "vscode",
+        "tag": f"localhost/agent-sandbox/dev-{ctx.project.id}-user:abc",
+    }  # fmt: skip
+
+
+def test_workspace_image_adds_the_dockerfile_layer(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    monkeypatch.setattr(sandbox, "ensure_user_image", lambda *a, **k: fake_image())
+    built: list[tuple[str, ...]] = []
+    engine.on(("build",), lambda args: built.append(args) and None)
+    engine.on(("image", "inspect", "--format"), lambda args: "sha256:ext" if built else 1)
+    (configured / ".agent-sandbox" / "Dockerfile").write_text("ARG base\nFROM $base\n")
+    ctx = make_ctx(configured, engine, config=ProjectConfig(image="i@sha256:1"))
+    image = sandbox.workspace_image(ctx)
+    assert image.ref.startswith(f"localhost/agent-sandbox/dev-{ctx.project.id}-extended:")
+    assert (image.image_id, image.base_id, image.home) == ("sha256:ext", "sha256:base", "/home/dev")
+    args = built[0]
+    assert args[args.index("--file") + 1] == str(configured / ".agent-sandbox" / "Dockerfile")
+    assert args[-1] == str(configured / ".agent-sandbox")  # the context: never the workspace
+    assert {"base=" + IMAGE, "user=dev", "uid=1000", "home=/home/dev"} <= set(args)
+    sandbox.workspace_image(ctx)
+    assert len(built) == 1  # same content, same tag: not built again
+
+
+def test_remote_env_never_overrides_the_toolkit_or_the_config(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm")
+    config = load_project_config(configured)
+    extra = {"HTTPS_PROXY": "http://evil:1", "TERM": "dumb", "CLAUDE_CONFIG_DIR": "/x", "NEW": "1"}
+    args = sandbox.exec_env(make_ctx(configured, config=config), "/home/dev", extra)
+    pairs = [args[i + 1] for i in range(0, len(args), 2)]
+    assert "NEW=1" in pairs
+    assert not any(p.startswith(("HTTPS_PROXY=http://evil", "TERM=dumb", "CLAUDE_CONFIG_DIR=/x"))
+                   for p in pairs)  # fmt: skip
+
+
+def test_remote_env_is_resolved_from_the_container(configured: Path) -> None:
+    engine = FakeEngine()
+    config = ProjectConfig(devcontainer=".devcontainer/devcontainer.json")
+    ctx = make_ctx(configured, engine, config=config)
+    metadata = [{"remoteEnv": {"P": "${containerEnv:PATH}:/opt", "W": "${localWorkspaceFolder}",
+                               "GONE": None}}]  # fmt: skip
+    engine.add("container", ctx.project.workspace_container,
+               {"devcontainer.metadata": json.dumps(metadata)}, Id="c")  # fmt: skip
+    engine.objects[("container", ctx.project.workspace_container)]["Config"]["Env"] = ["PATH=/bin"]
+    current = sandbox.session(ctx)
+    assert sandbox.remote_env(ctx, current) == {"P": "/bin:/opt", "W": str(configured)}
+    ctx.config.devcontainer, ctx.config.image = None, IMAGE
+    assert sandbox.remote_env(ctx, current) == {}

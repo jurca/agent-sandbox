@@ -3,16 +3,23 @@
 They need rootless docker (or another engine the CLI accepts), `setfacl`, and outbound HTTPS to
 example.com. Everything lives in /tmp/asb-it-* with isolated AGENT_SANDBOX_*_DIR; finalizers run
 `rm --state`. Images are never pulled: ASB_TEST_IMAGE (default: a local devcontainer image whose
-uid 1000 user exists) must be present, and the derived-image test uses the locally built
-tinyproxy image as its Alpine base.
+uid 1000 user exists) must be present, and the derived-image tests use the locally built
+tinyproxy image as their Alpine base. The devcontainer test only runs when
+ASB_TEST_DEVCONTAINER_CLI names the devcontainers CLI (e.g. "npx @devcontainers/cli") and
+ASB_TEST_DEVCONTAINER_IMAGE (default debian:bookworm-slim) is present; it uses a local Feature,
+so it needs no registry.
 """
 
 from __future__ import annotations
 
+import getpass
+import grp
+import json
 import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -26,8 +33,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_sandbox.config import DEFAULT_PROXY_BASE_IMAGE
-from agent_sandbox.images import derived_tag, proxy_image_tag
+from agent_sandbox.config import DEFAULT_PROXY_BASE_IMAGE, UserConfig
+from agent_sandbox.engine import detect_engine
+from agent_sandbox.images import derived_tag, ensure_user_image, proxy_image_tag
 from agent_sandbox.project import make_id
 
 from .conftest import git, make_repo
@@ -770,3 +778,182 @@ def test_ls_rm_name_and_prune(env: Env, scratch: Path) -> None:
     assert run.code == 0, run.output
     assert f"removed volume agent-sandbox-state-{sandbox_id}-claude" in run.output
     removed_by_id(sandbox_id)
+
+
+# --- environment setup ------------------------------------------------------------------
+
+
+def append_config(root: Path, text: str) -> None:
+    with (root / ".agent-sandbox" / "config.toml").open("a") as handle:
+        handle.write("\n" + text)
+
+
+USER = getpass.getuser()  # the name the CLI uses in image tags
+
+
+def remove_images(prefix: str) -> None:
+    listing = engine("images", "--format", "{{.Repository}}:{{.Tag}}").stdout.split()
+    for ref in listing:
+        if ref.startswith(prefix):
+            engine("image", "rm", "-f", ref)
+
+
+def test_setup_runs_before_the_harness_with_allow_extra(env: Env, scratch: Path) -> None:
+    (scratch / ".agent-sandbox" / "allow.extra").write_text("example.com\n")
+    append_config(
+        scratch,
+        "[setup]\ncreate = [\n"
+        '  "echo run >> setup-ran",\n'
+        "  \"curl -sS -o /dev/null -w '%{http_code}' https://example.com > setup-net\",\n"
+        '  "curl -s -o /dev/null https://pypi.org || true",\n'
+        ']\nstart = ["echo s >> started"]\n',
+    )
+    approve(env, scratch)
+    first = ok(env, scratch)
+    assert (scratch / "setup-ran").read_text() == "run\n"
+    assert (scratch / "setup-net").read_text() == "200"
+    assert "agent-sandbox: blocked: pypi.org" in first.err
+    assert re.search(r"\n\s+1\s+pypi\.org", first.err), first.err
+    assert proxy_state(env, scratch) == "base"
+    assert probe(env, scratch, "example.com:443") == {"example.com:443": "403"}
+    ok(env, scratch)
+    assert (scratch / "setup-ran").read_text() == "run\n"  # once per container
+    assert (scratch / "started").read_text() == "s\n"  # once per start
+    ok(env, scratch, "stop")
+    ok(env, scratch)
+    assert (scratch / "started").read_text() == "s\ns\n"
+    ok(env, scratch, "setup")
+    assert (scratch / "setup-ran").read_text() == "run\nrun\n"
+    assert "setup:      done" in ok(env, scratch, "status").out
+    ok(env, scratch, "recreate")
+    assert "pending" in ok(env, scratch, "status").out
+    ok(env, scratch)
+    assert (scratch / "setup-ran").read_text() == "run\nrun\nrun\n"
+
+
+def test_failed_setup_keeps_the_harness_from_starting(env: Env, scratch: Path) -> None:
+    append_config(scratch, '[setup]\ncreate = ["test -f allow-setup"]\n')
+    approve(env, scratch)
+    failed = asb(env, scratch)
+    assert failed.code == 1 and "Setup did not finish" in failed.err, failed.text
+    assert "failed with exit code 1: create from config.toml: test -f allow-setup" in failed.err
+    ok(env, scratch, "exec", "--", "true")  # exec still works
+    (scratch / "allow-setup").touch()
+    ok(env, scratch, "setup")
+    ok(env, scratch)
+
+
+def test_dockerfile_layer_is_built_from_the_config_dir(env: Env, scratch: Path) -> None:
+    cfg = scratch / ".agent-sandbox"
+    (cfg / "hello.txt").write_text("hi\n")
+    (cfg / "Dockerfile").write_text(
+        "ARG base\nFROM $base\nARG user\nUSER root\n"
+        'COPY hello.txt /etc/asb-hello\nRUN echo "$user" > /etc/asb-user\n'
+    )
+    try:
+        approve(env, scratch)
+        name = sh(env, scratch, "id -un").strip()
+        assert sh(env, scratch, "cat /etc/asb-hello /etc/asb-user") == f"hi\n{name}\n"
+        (cfg / "hello.txt").write_text("changed\n")
+        refused = PtyRun(env, scratch, ("exec", "--", "true"), answer((r"Approve", "y")))
+        result = refused.start().wait()
+        assert result.code == 1 and "changed: dockerfile" in result.output, result.output
+        ok(env, scratch, "recreate")
+        assert sh(env, scratch, "cat /etc/asb-hello") == "changed\n"
+    finally:
+        asb(env, scratch, "rm", "--state")
+        remove_images(f"localhost/agent-sandbox/{USER}-{make_id(scratch)}-extended:")
+
+
+@pytest.mark.parametrize("remote", ["vscode", "newuser"])
+def test_devcontainer_user_gets_the_host_uid(env: Env, remote: str) -> None:
+    alpine = proxy_image_tag(DEFAULT_PROXY_BASE_IMAGE)
+    if not has_image(alpine):
+        pytest.skip("local tinyproxy image missing")
+    base = "localhost/asb-it-remote-user:1"
+    build = subprocess.run(
+        [ENGINE, "build", "--tag", base, "-"],
+        input=f"FROM {alpine}\nUSER root\nRUN adduser -D -u 4321 vscode && "
+        "touch /home/vscode/marker\nUSER vscode\n",
+        capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert build.returncode == 0, build.stderr
+    user = os.environ.get("USER", "user")
+    tag = derived_tag(user, base)
+    try:
+        image = ensure_user_image(
+            detect_engine(UserConfig(engine=ENGINE)), base, user=user, uid=os.getuid(),
+            gid=os.getgid(), group=grp.getgrgid(os.getgid()).gr_name, remote_user=remote,
+        )  # fmt: skip
+        assert (image.name, image.home, image.ref) == (remote, f"/home/{remote}", tag)
+        script = 'id -un; stat -c %u "$HOME"; ls -A "$HOME"'
+        out = engine("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "--entrypoint",
+                     "sh", tag, "-c", script).stdout.split()  # fmt: skip
+        assert out[:2] == [remote, str(os.getuid())]
+        assert ("marker" in out) == (remote == "vscode")  # the existing home was kept
+    finally:
+        engine("image", "rm", "-f", tag, base)
+
+
+DEVCONTAINER_CLI = os.environ.get("ASB_TEST_DEVCONTAINER_CLI")
+DEVCONTAINER_IMAGE = os.environ.get("ASB_TEST_DEVCONTAINER_IMAGE", "debian:bookworm-slim")
+
+
+def test_devcontainer_flow(env: Env, scratch: Path) -> None:
+    if not DEVCONTAINER_CLI:
+        pytest.skip("set ASB_TEST_DEVCONTAINER_CLI to run the devcontainer test")
+    if not has_image(DEVCONTAINER_IMAGE):
+        pytest.skip(f"{DEVCONTAINER_IMAGE} is not present locally")
+    cli = shlex.split(DEVCONTAINER_CLI)
+    dc = scratch / ".devcontainer"
+    (dc / "hello").mkdir(parents=True)
+    (dc / "hello" / "devcontainer-feature.json").write_text(json.dumps({
+        "id": "hello", "version": "1.0.0", "name": "hello", "containerEnv": {"HELLO": "1"},
+        "postCreateCommand": "echo feature >> dc-created",
+    }))  # fmt: skip
+    (dc / "hello" / "install.sh").write_text(
+        "#!/bin/sh\nset -e\necho hi > /usr/local/bin/hello-from-feature\n"
+    )
+    (dc / "devcontainer.json").write_text(json.dumps({
+        "image": DEVCONTAINER_IMAGE, "remoteUser": "dev", "features": {"./hello": {}},
+        "remoteEnv": {"FROM_DC": "${localWorkspaceFolderBasename}"},
+        "postCreateCommand": "echo created >> dc-created",
+        "postAttachCommand": "echo attach >> dc-attached",
+        "runArgs": ["--privileged"],
+    }))  # fmt: skip
+    config = scratch / ".agent-sandbox" / "config.toml"
+    text = re.sub(r"(?m)^image = .*\n", "", config.read_text())
+    config.write_text(text.replace('harness = "bash"', 'harness = "true"'))
+    append_config(scratch, "[devcontainer]\nenabled = true\n")
+    env.user_config.write_text(f"devcontainer_cli = {json.dumps(cli)}\n")
+    try:
+        first = PtyRun(env, scratch, (), answer((r"Approve", "y"))).start().wait(300)
+        assert first.code == 1 and "has no lockfile" in first.output, first.output
+        assert "upgrade --workspace-folder . --config .devcontainer/devcontainer.json" in (
+            first.output.replace("\r\n", " ").replace("\n", " ").replace("  ", " ")
+        )
+        upgrade = [*cli, "upgrade", "--workspace-folder", ".", "--config",
+                   ".devcontainer/devcontainer.json"]  # fmt: skip
+        assert (
+            subprocess.run(upgrade, cwd=scratch, capture_output=True, check=False).returncode == 0
+        )
+        second = PtyRun(env, scratch, (), answer((r"Approve", "y"))).start().wait(600)
+        assert second.code == 0, second.output
+        assert "runArgs is not applied" in second.output
+        assert f"{DEVCONTAINER_IMAGE} is not pinned" in second.output
+        assert (scratch / "dc-created").read_text() == "feature\ncreated\n"
+        assert (scratch / "dc-attached").read_text() == "attach\n"
+        out = sh(
+            env, scratch, 'id -un; echo "$HELLO $FROM_DC"; cat /usr/local/bin/hello-from-feature'
+        )
+        assert out == f"dev\n1 {scratch.name}\nhi\n"
+        ok(env, scratch)
+        assert (scratch / "dc-created").read_text() == "feature\ncreated\n"
+        assert (scratch / "dc-attached").read_text() == "attach\nattach\n"
+        touched = sh(env, scratch, "touch .devcontainer/x 2>/dev/null && echo writable || echo ro")
+        assert touched == "ro\n"
+    finally:
+        env.user_config.unlink(missing_ok=True)
+        asb(env, scratch, "rm", "--state")
+        for layer in ("devcontainer", "user"):
+            remove_images(f"localhost/agent-sandbox/{USER}-{make_id(scratch)}-{layer}:")

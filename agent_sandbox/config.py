@@ -15,7 +15,11 @@ CONFIG_FILE = "config.toml"
 PROXY_CONF_FILE = "tinyproxy.conf"
 ALLOW_BASE_FILE = "allow.base"
 ALLOW_EXTRA_FILE = "allow.extra"
-APPROVED_FILES = (CONFIG_FILE, PROXY_CONF_FILE, ALLOW_BASE_FILE, ALLOW_EXTRA_FILE)
+STANDARD_FILES = (CONFIG_FILE, PROXY_CONF_FILE, ALLOW_BASE_FILE, ALLOW_EXTRA_FILE)
+DOCKERFILE = "Dockerfile"
+DEVCONTAINER_DIR = ".devcontainer"
+DEFAULT_DEVCONTAINER_CONFIG = f"{DEVCONTAINER_DIR}/devcontainer.json"
+DEFAULT_DEVCONTAINER_CLI = ("devcontainer",)
 
 DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
 DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
@@ -42,7 +46,9 @@ class MountSpec:
 
 @dataclass
 class ProjectConfig:
-    image: str
+    image: str | None = None
+    # devcontainer.json (relative to the workspace root) when the devcontainer is the base.
+    devcontainer: str | None = None
     harness: str = "bash"
     env_pass: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_PASS))
     env_set: dict[str, str] = field(default_factory=dict)
@@ -51,6 +57,8 @@ class ProjectConfig:
     protected: list[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED))
     isolated: list[str] = field(default_factory=lambda: list(DEFAULT_ISOLATED))
     proxy_base_image: str | None = None
+    setup_create: list[str] = field(default_factory=list)
+    setup_start: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +70,7 @@ class UserConfig:
     state_volume: str = "per-workspace"
     workspaces: dict[str, dict[str, str]] = field(default_factory=dict)
     proxy_base_image: str | None = None
+    devcontainer_cli: list[str] = field(default_factory=lambda: list(DEFAULT_DEVCONTAINER_CLI))
 
     def git_mode(self, workspace: Path) -> str:
         return self.workspaces.get(str(workspace), {}).get("git", self.git)
@@ -130,12 +139,62 @@ def _load_toml(path: Path) -> dict[str, Any]:
         raise SandboxError(f"{path}: invalid TOML: {exc}") from exc
 
 
-def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> ProjectConfig:
-    _only(data, {"image", "harness", "env", "workspace", "mounts", "state", "proxy"}, where)
-    image = data.get("image")
-    if not isinstance(image, str) or not image.strip():
+def _devcontainer_config(data: dict[str, Any], where: str) -> str | None:
+    table = _table(data, "devcontainer", where)
+    _only(table, {"enabled", "config"}, f"{where} [devcontainer]")
+    enabled = table.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise SandboxError(f"{where}: [devcontainer] enabled must be true or false.")
+    raw = table.get("config", DEFAULT_DEVCONTAINER_CONFIG)
+    if not enabled:
+        if "config" in table:
+            raise SandboxError(f"{where}: [devcontainer] config needs `enabled = true`.")
+        return None
+    path = PurePosixPath(raw) if isinstance(raw, str) else None
+    if (
+        path is None
+        or path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) not in (2, 3)
+        or path.parts[0] != DEVCONTAINER_DIR
+        or path.name != "devcontainer.json"
+    ):
         raise SandboxError(
-            f"{where}: `image` is required. Run `agent-sandbox init --image IMAGE` or set it."
+            f"{where}: [devcontainer] config must be {DEFAULT_DEVCONTAINER_CONFIG} or "
+            f"{DEVCONTAINER_DIR}/<name>/devcontainer.json: everything the image build reads "
+            f"has to be in {DEVCONTAINER_DIR}/, which the agent cannot write."
+        )
+    return str(path)
+
+
+def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> ProjectConfig:
+    _only(
+        data,
+        {
+            "image",
+            "devcontainer",
+            "harness",
+            "env",
+            "workspace",
+            "mounts",
+            "state",
+            "proxy",
+            "setup",
+        },
+        where,
+    )
+    image = data.get("image")
+    devcontainer = _devcontainer_config(data, where)
+    if image is not None and (not isinstance(image, str) or not image.strip()):
+        raise SandboxError(f"{where}: `image` must be a non-empty string.")
+    if image is not None and devcontainer is not None:
+        raise SandboxError(
+            f"{where}: set either `image` or `[devcontainer] enabled = true`, not both."
+        )
+    if image is None and devcontainer is None:
+        raise SandboxError(
+            f"{where}: `image` is required (or `[devcontainer] enabled = true`). "
+            "Run `agent-sandbox init --image IMAGE` or set it."
         )
     harness = data.get("harness", "bash")
     if not isinstance(harness, str) or not harness.strip():
@@ -192,6 +251,8 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         if "isolated" in workspace
         else list(DEFAULT_ISOLATED)
     )
+    if devcontainer is not None and DEVCONTAINER_DIR not in protected:
+        protected.append(DEVCONTAINER_DIR)  # the image build reads it; the agent must not write it
     for a in protected:
         for b in isolated:
             if _overlaps(a, b):
@@ -219,8 +280,17 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
     if base is not None and (not isinstance(base, str) or not base.strip()):
         raise SandboxError(f"{where}: [proxy] base_image must be a non-empty string.")
 
+    setup = _table(data, "setup", where)
+    _only(setup, {"create", "start"}, f"{where} [setup]")
+    setup_create = _string_list(setup.get("create", []), f"{where} [setup] create")
+    setup_start = _string_list(setup.get("start", []), f"{where} [setup] start")
+    for command in [*setup_create, *setup_start]:
+        if not command.strip():
+            raise SandboxError(f"{where}: [setup] commands must not be empty.")
+
     return ProjectConfig(
-        image=image.strip(),
+        image=image.strip() if image is not None else None,
+        devcontainer=devcontainer,
         harness=harness.strip(),
         env_pass=env_pass,
         env_set=dict(env_set_raw),
@@ -229,6 +299,8 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         protected=protected,
         isolated=isolated,
         proxy_base_image=base,
+        setup_create=setup_create,
+        setup_start=setup_start,
     )
 
 
@@ -247,10 +319,24 @@ def load_project_config(workspace: Path) -> ProjectConfig:
 def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserConfig:
     _only(
         data,
-        {"engine", "docker_context", "allow_rootful", "git", "state_volume", "workspaces", "proxy"},
+        {
+            "engine",
+            "docker_context",
+            "allow_rootful",
+            "git",
+            "state_volume",
+            "workspaces",
+            "proxy",
+            "devcontainer_cli",
+        },
         where,
     )
     config = UserConfig()
+    if "devcontainer_cli" in data:
+        command = _string_list(data["devcontainer_cli"], f"{where}: devcontainer_cli")
+        if not command or not command[0]:
+            raise SandboxError(f"{where}: devcontainer_cli must name a command.")
+        config.devcontainer_cli = command
     if "engine" in data:
         if data["engine"] not in ("auto", "docker", "podman"):
             raise SandboxError(f"{where}: engine must be auto, docker or podman.")

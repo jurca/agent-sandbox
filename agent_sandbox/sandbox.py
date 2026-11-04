@@ -15,18 +15,28 @@ import sys
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
-from . import approval, proxyctl
+from . import approval, devcontainer, proxyctl
 from .config import (
     DEFAULT_PROXY_BASE_IMAGE,
+    DOCKERFILE,
     PROJECT_DIR,
+    STANDARD_FILES,
     ProjectConfig,
     UserConfig,
     load_project_config,
     load_user_config,
 )
-from .engine import Engine, detect_engine
-from .images import ensure_proxy_image, ensure_user_image, host_uid_for
+from .engine import Engine, detect_engine, labels_of
+from .images import (
+    UserImage,
+    ensure_extension_image,
+    ensure_proxy_image,
+    ensure_user_image,
+    host_uid_for,
+    project_tag,
+)
 from .mounts import (
     SOCKET_RISK,
     BindMount,
@@ -50,7 +60,7 @@ from .project import (
     git_layout,
 )
 from .proxy import PROXY_ALIAS, PROXY_PORT, PROXY_UID
-from .util import SandboxError, eprint, require_phrase, runtime_dir
+from .util import SandboxError, eprint, require_phrase, runtime_dir, state_dir
 
 SPEC_VERSION = 2
 # Engines keep the writable layer across stop/start; a tmpfs gives every start an empty /tmp.
@@ -170,12 +180,66 @@ def make_plan(ctx: Context, home: str | None = None) -> Plan:
     return Plan(layout, mounts, volumes, isolated, ownership_mode(ctx.engine))
 
 
+# --- the image ------------------------------------------------------------------------
+
+
+def base_ref(ctx: Context) -> str:
+    """The image the user layer goes on: `image`, or the devcontainer build of the approved
+    `.devcontainer/` tree (named after its content, so it is known without building)."""
+    if ctx.config.devcontainer is not None:
+        return devcontainer.image_tag(ctx.project, ctx.username)
+    assert ctx.config.image is not None
+    return ctx.config.image
+
+
+def extension_digest(ctx: Context) -> str | None:
+    """The `.agent-sandbox/` content an extension build sees, or None without a Dockerfile.
+
+    The toolkit's own files are left out: they never change the image.
+    """
+    files = approval.tree_files(ctx.project.root / PROJECT_DIR)
+    if DOCKERFILE not in files:
+        return None
+    return approval.tree_hash({k: v for k, v in files.items() if k not in STANDARD_FILES})
+
+
+def workspace_image(ctx: Context, *, rebuild: bool = False, pull: bool = False) -> UserImage:
+    """Base (image or devcontainer build), user layer, then `.agent-sandbox/Dockerfile`."""
+    engine, remote_user, user_tag = ctx.engine, None, None
+    if ctx.config.devcontainer is not None:
+        ref = devcontainer.ensure_image(
+            engine, ctx.user, ctx.project, ctx.config.devcontainer,
+            username=ctx.username, rebuild=rebuild, pull=pull,
+        )  # fmt: skip
+        user_tag = project_tag(ctx.username, ctx.project.id, "user", ref.rpartition(":")[2])
+        info = engine.inspect("image", ref) or {}
+        metadata = devcontainer.parse_metadata(labels_of("image", info))
+        image_user = (info.get("Config") or {}).get("User")
+        remote_user = devcontainer.remote_user(metadata, image_user)
+        pull = False  # a local image
+    else:
+        ref = base_ref(ctx)
+        if "@sha256:" not in ref:
+            eprint(f"warning: {PROJECT_DIR}/config.toml: {devcontainer.unpinned_warning(ref)}")
+    image = ensure_user_image(
+        engine, ref, user=ctx.username, uid=ctx.uid, gid=ctx.gid, group=ctx.groupname,
+        rebuild=rebuild, pull=pull, remote_user=remote_user, tag=user_tag,
+    )  # fmt: skip
+    digest = extension_digest(ctx)
+    if digest is not None:
+        image = ensure_extension_image(
+            engine, image, ctx.project.root / PROJECT_DIR,
+            user=ctx.username, project_id=ctx.project.id, digest=digest, rebuild=rebuild,
+        )  # fmt: skip
+    return image
+
+
 def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, object]:
-    return {
+    spec: dict[str, object] = {
         "spec_version": SPEC_VERSION,
         "engine": ctx.engine.kind,
         "rootless": ctx.engine.rootless,
-        "base_ref": ctx.config.image,
+        "base_ref": base_ref(ctx),
         "base_id": base_id or "missing",
         "user": ctx.username,
         "uid": ctx.uid,
@@ -188,6 +252,10 @@ def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, obj
         "network": ctx.project.network,
         "tmp": "tmpfs",
     }
+    # Only when used, so containers created before these existed keep their hash.
+    if (digest := extension_digest(ctx)) is not None:
+        spec["dockerfile"] = digest
+    return spec
 
 
 def spec_hash(spec: dict[str, object]) -> str:
@@ -304,9 +372,11 @@ def start_proxy(ctx: Context) -> None:
 
 def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
     engine, project = ctx.engine, ctx.project
-    image = ensure_user_image(
-        engine, ctx.config.image, user=ctx.username, uid=ctx.uid, gid=ctx.gid, group=ctx.groupname
-    )
+    image = workspace_image(ctx)
+    if ctx.config.devcontainer is not None:
+        metadata = devcontainer.parse_metadata(engine.labels("image", image.ref) or {})
+        for message in devcontainer.not_applied(metadata):
+            eprint(f"warning: {message}")
     proxy_image = ensure_proxy_image(engine, ctx.proxy_base_image)
     plan = make_plan(ctx, image.home)
     check_sockets(ctx, plan, unsafe=unsafe_sockets)
@@ -503,7 +573,7 @@ def ensure_ready(ctx: Context, *, unsafe_sockets: bool = False) -> None:
                 "directory. Remove it with `agent-sandbox ls` / `agent-sandbox rm NAME`."
             )
         plan = make_plan(ctx, labels.get(LABEL_HOME))
-        spec = compute_spec(ctx, plan, engine.image_id(ctx.config.image))
+        spec = compute_spec(ctx, plan, engine.image_id(base_ref(ctx)))
         if labels.get(LABEL_SPEC) != spec_hash(spec):
             try:
                 old = json.loads(labels.get(LABEL_SPEC_JSON, "{}"))
@@ -534,7 +604,58 @@ def container_home(ctx: Context) -> str:
     return labels.get(LABEL_HOME, f"/home/{ctx.username}")
 
 
-def exec_env(ctx: Context, home: str) -> list[str]:
+@dataclass
+class Session:
+    """What execs as the sandbox user need to know about the running container."""
+
+    home: str
+    labels: dict[str, str]
+    container_id: str
+    started_at: str
+    image_env: dict[str, str]
+
+    @property
+    def metadata(self) -> list[dict[str, Any]]:
+        return devcontainer.parse_metadata(self.labels)
+
+
+def session(ctx: Context) -> Session:
+    info = ctx.engine.inspect("container", ctx.project.workspace_container) or {}
+    labels = labels_of("container", info)  # includes the image's labels
+    env = dict(item.partition("=")[::2] for item in (info.get("Config") or {}).get("Env") or [])
+    return Session(
+        home=labels.get(LABEL_HOME, f"/home/{ctx.username}"),
+        labels=labels,
+        container_id=str(info.get("Id", "")),
+        started_at=str((info.get("State") or {}).get("StartedAt", "")),
+        image_env=env,
+    )
+
+
+def substitution(ctx: Context, current: Session) -> devcontainer.Substitution:
+    return devcontainer.Substitution(
+        workspace=ctx.project.root,
+        devcontainer_id=ctx.project.id,
+        env_pass=ctx.config.env_pass,
+        container_env=current.image_env,
+    )
+
+
+def remote_env(ctx: Context, current: Session) -> dict[str, str]:
+    """The devcontainer's remoteEnv with its variables resolved (null unsets: left out)."""
+    if ctx.config.devcontainer is None:
+        return {}
+    subst = substitution(ctx, current)
+    return {
+        key: subst.text(value)
+        for key, value in devcontainer.remote_env(current.metadata).items()
+        if value is not None
+    }
+
+
+def exec_env(ctx: Context, home: str, extra: dict[str, str] | None = None) -> list[str]:
+    """Environment arguments; `extra` (remoteEnv) never overrides the toolkit's own variables
+    or the configured ones."""
     values: dict[str, str] = {
         "HTTP_PROXY": PROXY_URL,
         "HTTPS_PROXY": PROXY_URL,
@@ -551,6 +672,10 @@ def exec_env(ctx: Context, home: str) -> list[str]:
     args: list[str] = []
     for key, value in values.items():
         args += ["-e", f"{key}={value}"]
+    configured = set(ctx.config.env_set) | {n for n in ctx.config.env_pass if n in os.environ}
+    for key, value in (extra or {}).items():
+        if key not in values and key not in configured:
+            args += ["-e", f"{key}={value}"]
     for name in ctx.config.env_pass:
         if name in os.environ:
             args += ["-e", name]
@@ -607,12 +732,13 @@ def _resolve_command(ctx: Context, command: list[str] | None, home: str) -> list
 
 def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bool = False) -> None:
     """Replace this process with `engine exec` into the workspace container."""
-    home = container_home(ctx)
+    current = session(ctx)
+    home = current.home
     tty = sys.stdin.isatty() and sys.stdout.isatty()
     args = ["exec", "-i"] + (["-t"] if tty else [])
     args += ["--user", "0" if root else f"{ctx.uid}:{ctx.gid}"]
     args += ["--workdir", str(ctx.project.root)]
-    args += exec_env(ctx, home)
+    args += exec_env(ctx, home, None if root else remote_env(ctx, current))
     if root:
         note = ROOT_NOTE_ROOTLESS if ctx.engine.rootless else ROOT_NOTE_ROOTFUL
         args += [
@@ -666,4 +792,6 @@ def remove_by_id(engine: Engine, sandbox_id: str, *, state: bool) -> list[str]:
             engine.run("volume", "rm", name)
             removed.append(f"volume {name}")
     shutil.rmtree(runtime_dir() / sandbox_id, ignore_errors=True)
+    if state:
+        (state_dir() / "setup" / f"{sandbox_id}.json").unlink(missing_ok=True)
     return removed

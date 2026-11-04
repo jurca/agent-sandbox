@@ -45,6 +45,18 @@ paths = [".claude", ".copilot", ".cache/pre-commit"]
 
 # [proxy]
 # base_image = "docker.ops.corp.example/upstream/alpine:3"
+
+# Commands that prepare the container (see `agent-sandbox help setup`). `create` runs once per
+# container before the first harness start, with the hosts in allow.extra reachable; `start`
+# runs once per container start.
+# [setup]
+# create = ["uv sync", "pre-commit install-hooks"]
+# start = []
+
+# Instead of `image`: build the base from the project's devcontainer (remove `image` above).
+# [devcontainer]
+# enabled = true
+# config = ".devcontainer/devcontainer.json"
 """
 
 TINYPROXY_CONF = """\

@@ -1,7 +1,7 @@
 # agent-sandbox - product requirements
 
 Status: implemented and tested on rootless docker (see section 10); podman and rootful untested.
-Section 6 (environment setup) is designed but not implemented yet.
+Section 6 (environment setup, devcontainer base) is implemented and tested the same way.
 The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
 
 ## 1. Purpose and threat model
@@ -66,7 +66,10 @@ Per workspace (identified by `<dirname>-<8 hex of sha256(abs path)>`, called `<i
 | state volumes | `agent-sandbox-state-<id>-<path>` | harness state, one volume per configured path |
 | isolated volumes | `agent-sandbox-isolated-<id>-<path>-<6 hex of sha256(path)>` | the sandbox's own copy of an isolated workspace path (the hash keeps `.venv` and `venv` apart) |
 | runtime dir | `$XDG_RUNTIME_DIR/agent-sandbox/<id>/` | the CLI's own records: lock, deadline copy, `net` session and pid |
-| derived image | `localhost/agent-sandbox/<user>-<flattened base>:<tag>` | base image plus the host user |
+| derived image | `localhost/agent-sandbox/<user>-<flattened base>:<tag>` | `image` plus the host user; shared by the projects using that image |
+| devcontainer image | `localhost/agent-sandbox/<user>-<id>-devcontainer:<hash of .devcontainer/>` | `devcontainer build` result, the base when `[devcontainer] enabled`; per user, as `${localEnv:...}` can reach the build |
+| devcontainer user image | `localhost/agent-sandbox/<user>-<id>-user:<hash of .devcontainer/>` | the devcontainer image plus the host user (the remote user given the host uid) |
+| extended image | `localhost/agent-sandbox/<user>-<id>-extended:<hash>` | `.agent-sandbox/Dockerfile` on top of the user image |
 | proxy image | `localhost/agent-sandbox/tinyproxy:<hash>` | tinyproxy built locally from a configurable base (default public `alpine:3`) |
 
 Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec/...`) so `ls`,
@@ -153,11 +156,12 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 
 ### Project: `.agent-sandbox/` (committed)
 
-- `config.toml`: `image` (required), `harness` (default `bash`), `[env] pass`/`[env.set]`,
+- `config.toml`: `image` or `[devcontainer] enabled`/`config` (exactly one, section 6), `harness`
+  (default `bash`), `[env] pass`/`[env.set]`,
   `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`, `.devcontainer`),
   `[workspace] isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target`
   defaulting to `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
-  `.cache/pre-commit`), `[proxy] base_image`. Unknown keys are errors.
+  `.cache/pre-commit`), `[proxy] base_image`, `[setup] create`/`start`. Unknown keys are errors.
 - Workspace paths (`protected`, `isolated`) are relative to the workspace root and normalised
   (`./x/` -> `x`); absolute paths, `..`, `.`, anything under `.git` or `.agent-sandbox` (already
   read-only) and a path that is protected and isolated at once (equal or nested) are errors.
@@ -176,17 +180,21 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### User: `~/.config/agent-sandbox/config.toml` (never in the repo)
 
 `engine`, `docker_context`, `allow_rootful`, `git` (`ro`/`rw`), `state_volume`
-(`per-workspace` or a shared name), `[workspaces."/abs/path"]` overrides, `[proxy] base_image`.
+(`per-workspace` or a shared name), `[workspaces."/abs/path"]` overrides, `[proxy] base_image`,
+`devcontainer_cli` (command list, default `["devcontainer"]`).
 Shared state volumes belong to no single workspace: `rm --state` and `prune` keep them (with a note)
 and `ls` does not list them.
 Env overrides: `AGENT_SANDBOX_CONFIG_DIR`, `_STATE_DIR`, `_RUNTIME_DIR`, `AGENT_SANDBOX_ALLOW_ROOTFUL`.
 
 ### Trust on first use
 
-Config arrives via git, so it could widen mounts or allowlists. The host stores a snapshot of the four
-files in `~/.local/state/agent-sandbox/approved/<id>/`. Any difference (including the first run after a
-clone) shows a unified diff and asks y/N; non-interactive runs refuse. `init` and the `net` promotion
-step record approval themselves.
+Config arrives via git, so it could widen mounts or allowlists or change the image. The host stores
+a snapshot of the whole `.agent-sandbox/` tree (a Dockerfile there may copy any file of it) and,
+with `[devcontainer] enabled`, of the whole `.devcontainer/` tree in
+`~/.local/state/agent-sandbox/approved/<id>/{agent-sandbox,devcontainer}/` (the flat four-file
+layout of older versions is still read). Any difference (including the first run after a clone)
+shows a unified diff (binary files by size, symlinks by target) and asks y/N; non-interactive runs
+refuse. `init` and the `net` promotion step record approval themselves.
 
 ### Drift detection
 
@@ -317,7 +325,7 @@ people working in the project's dev container and the agent get the same environ
   install it. It is used only for `build`, `upgrade` (in printed instructions) and
   `read-configuration`.
 - **Build**: `devcontainer build --workspace-folder ROOT --config PATH --frozen-lockfile
-  --image-name localhost/agent-sandbox/devcontainer-<id>:<hash of the approved tree>
+  --image-name localhost/agent-sandbox/<user>-<id>-devcontainer:<hash of the approved tree>
   --docker-path ENGINE`, result parsed from the JSON line on stdout. `rebuild` adds `--no-cache`.
   Verified with CLI 0.90.0 on rootless docker: `build` never runs `initializeCommand` (only `up`
   does), never remaps uids, installs each Feature's `install.sh` as root in a generated
@@ -368,19 +376,25 @@ others become the default (or empty) with a warning; anything else is left as is
 ### Setup layer
 
 - Sources: `[setup] create = [...]` and `[setup] start = [...]` in config.toml (each entry a shell
-  command, run with `sh -c` in order), then the devcontainer lifecycle commands mapped above.
+  command, run with `sh -c` in order, without `${...}` substitution, which is left to the shell),
+  then the devcontainer lifecycle commands mapped above (`${devcontainerId}` is the workspace id).
   Devcontainer command forms: a string runs with `sh -c`, an array runs directly, an object runs
   its named commands in parallel with output prefixed by the name. Per hook, label order (Features
   first). Every command is a separate process, as in the CLI (`runRemoteCommand` with
   `/bin/sh -c` or the array, on a PTY), so nothing it exports reaches the harness; that holds for
   `postAttachCommand` too.
-- Runs as the sandbox user with the normal exec environment, in the workspace root, through the
-  proxy with the `net` tier open for its duration (a scoped `net` session; an active `net` session
-  is reused). It cannot have a direct route: the workspace (agent-written, e.g. dependency build
-  hooks) and the state volumes (harness credentials) are already mounted.
-- Success is recorded on the host (state dir, keyed by container id) only after every create
-  command succeeded, together with a hash of the commands. A new container (`recreate`) has no
-  record.
+- Runs as the sandbox user with the normal exec environment (plus `remoteEnv`), in the workspace
+  root, no TTY. Only the **create phase** gets the `net` tier (base + `allow.extra`), and only
+  through the proxy: it cannot have a direct route, because the workspace (agent-written, e.g.
+  dependency build hooks) and the state volumes (harness credentials) are already mounted. The
+  tier is a lease of 5 minutes renewed every minute while it runs, so a killed CLI closes it soon;
+  an active `net` session is used as it is and left running, and a lease taken over by `net
+  --extend`/`--stop` is left alone. The start and attach phases stay on the base tier: a harness
+  may already run in another terminal then.
+- Success is recorded on the host (`~/.local/state/agent-sandbox/setup/<id>.json`, keyed by
+  container id) only after every create command succeeded, together with a hash of the commands.
+  A new container (`recreate`) or changed commands have no matching record; `rm --state` deletes
+  it. One setup runs at a time per workspace (a lock in the runtime dir).
 - **Automatic**: a harness start (plain `agent-sandbox`) without a matching record runs the create
   phase first, under a header saying so (it can take long). This needs no separate consent: the
   only extra network is `allow.extra`, already approved, and only while setup runs, before any
@@ -391,7 +405,9 @@ others become the default (or empty) with a warning; anything else is left as is
   started and the message says to run `agent-sandbox setup`, which reruns the create phase without
   a `recreate`, so commands must be idempotent (`uv sync`, `poetry sync` and
   `pre-commit install-hooks` are).
-- The start phase runs whenever the CLI starts the workspace container; failures warn.
+- The start phase runs once per container start (recorded by the container's `StartedAt`), after
+  the create phase, before the next harness start; failures warn. `agent-sandbox setup` reruns
+  both phases.
 - `pre-commit install` does not belong here: it writes `.git/hooks/pre-commit`, which host git
   executes, and with `.git` shared with the host it changes nothing that a host-side install has not
   done. `pre-commit install-hooks` (fills `~/.cache/pre-commit`, a state path) is the useful part
@@ -415,8 +431,8 @@ others become the default (or empty) with a warning; anything else is left as is
 | `stop` | stop workspace and proxy |
 | `rm [NAME] [--state]` | remove containers, network, runtime dir; keeps state and isolated volumes unless `--state`; never touches workspace files |
 | `recreate` | remove containers and network (keeps state and isolated volumes), then create again |
-| `rebuild [--pull]` | rebuild derived and proxy images (then `recreate`) |
-| `setup` | (planned, section 6) rerun the setup create phase in the running container |
+| `rebuild [--pull]` | rebuild every workspace image layer (devcontainer with `--no-cache`) and the proxy image (then `recreate`) |
+| `setup` | rerun the setup create and start phases in the running container (section 6) |
 | `ls` | all sandboxes on all engines, orphans flagged |
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
 | `status` | state, approval, drift, proxy tier and time left |
@@ -468,7 +484,10 @@ creation rolls back what it created on failure; at most one network session per 
 - Unit tests (pytest, no engine): config parsing/validation, durations, allowlist and NO_PROXY parsing,
   Upstream/Filter generation incl. allow-all ordering, log parsing, derived tag naming, spec hashing,
   uid-map arithmetic, symmetric ACLs, the reclaim walk, the reclaim `chown` ids and its no-op when
-  the sandbox user is the host user, mount validation, socket scan, approval, argument parsing, probe parsing.
+  the sandbox user is the host user, mount validation, socket scan, approval (trees, binary files,
+  old snapshots), argument parsing, probe parsing, devcontainer metadata (remote user, not-applied
+  settings, lifecycle steps, `${...}` substitution), configuration checks and lockfile errors, the
+  setup phases and their records, image layering and the spec.
 - Integration tests (marked `integration`, opt-in with `pytest --integration`, on the user's rootless
   docker, using temp repos under `/tmp/asb-it-*` and isolated `AGENT_SANDBOX_*_DIR`; no image pulls, so
   the base image must be local): create and exec, ownership/ACL, a file replaced by `sed -i` in the
@@ -478,7 +497,13 @@ creation rolls back what it created on failure; at most one network session per 
   approval, drift/recreate, sockets, rm/ls/prune, clone, linked worktree, shared state volume, derived
   image on Alpine, host-path working directory, protected paths read-only and created empty on the
   host, isolated volumes hiding the host copy, owned by the user and surviving `recreate`, `/tmp`
-  emptied by `stop` while `/var/tmp` survives, `/tmp` executable.
+  emptied by `stop` while `/var/tmp` survives, `/tmp` executable; setup create with
+  `allow.extra` (blocked hosts reported, base tier afterwards), once per container, start once per
+  start, failure keeping the harness from starting until `setup` succeeds; the
+  `.agent-sandbox/Dockerfile` layer and its drift; a devcontainer `remoteUser` remapped or
+  created; and, when `ASB_TEST_DEVCONTAINER_CLI` is set, the devcontainer flow (missing lockfile,
+  `upgrade`, build with a local Feature, lifecycle commands, `remoteEnv`, read-only
+  `.devcontainer/`).
 - Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
@@ -542,7 +567,7 @@ creation rolls back what it created on failure; at most one network session per 
 
 ## 12. Deferred / out of scope for v1
 
-OpenCode defaults; environment setup (designed in section 6, not implemented); replacing the user's separate
+OpenCode defaults; replacing the user's separate
 `workspace-sandbox` scripts (to be revisited after solo testing); Podman and rootful verification;
 Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
 user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
