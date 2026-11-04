@@ -1,6 +1,7 @@
 # agent-sandbox - product requirements
 
-Status: implemented and tested on rootless docker (see section 9); podman and rootful untested.
+Status: implemented and tested on rootless docker (see section 10); podman and rootful untested.
+Section 6 (environment setup) is designed but not implemented yet.
 The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
 
 ## 1. Purpose and threat model
@@ -20,9 +21,9 @@ Key properties:
 - Anything the agent writes that the host later **executes or trusts** is an escape route.
   Tracked files show up in `git diff`; gitignored ones do not. So configuration that host tools
   execute (`.claude/` hooks incl. the ignored `settings.local.json`, `.agents/`, `.vscode/`,
-  `.idea/`, `.devcontainer/`) is **protected** (read-only), and dependency trees the host runs (`.venv`,
-  `node_modules`) are **isolated**: the sandbox gets its own copy in a volume and never writes the
-  host's.
+  `.idea/`, `.devcontainer/`) is **protected** (read-only), and dependency trees the host runs
+  (`.venv`, `node_modules`) are **isolated**: the sandbox gets its own copy in a volume and never
+  writes the host's.
 - What remains is **inescapable by design**: the agent's job is to write code that you then run.
   Tests started on the host by pre-commit or by hand, build scripts, a `Makefile`, a dev server,
   CI jobs (which often hold deploy keys and tokens in their environment): any of it can do
@@ -153,10 +154,9 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### Project: `.agent-sandbox/` (committed)
 
 - `config.toml`: `image` (required), `harness` (default `bash`), `[env] pass`/`[env.set]`,
-  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`,
-  `.devcontainer`), `[workspace]
-  isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target` defaulting to
-  `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
+  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`, `.devcontainer`),
+  `[workspace] isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target`
+  defaulting to `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
   `.cache/pre-commit`), `[proxy] base_image`. Unknown keys are errors.
 - Workspace paths (`protected`, `isolated`) are relative to the workspace root and normalised
   (`./x/` -> `x`); absolute paths, `..`, `.`, anything under `.git` or `.agent-sandbox` (already
@@ -249,7 +249,160 @@ with the list of changed keys and tells the user to run `recreate`.
   with counts and the user may append them to `allow.extra` (`y`, `N` or `s`elect each); the approval
   snapshot is updated.
 
-## 6. Commands
+## 6. Environment setup (planned)
+
+Projects need more than a base image: system packages, devcontainer Features, internal CA
+certificates, `~/.bashrc` changes, and per-workspace steps such as `uv sync`, `poetry sync` or
+`pre-commit install-hooks`. Two layers, because the two kinds have different properties:
+
+| | Image layer | Setup layer |
+|---|---|---|
+| What | tools, system packages, CA certificates, home dotfiles | dependency installs and caches that need the workspace |
+| Runs | at image build, as root | in the container after creation, as the sandbox user |
+| Survives `recreate` | yes (cached image) | its results do where they live in volumes (`.venv`, state paths) |
+| Network | the build's own (host network); inputs are approved files only | through the proxy, `allow.extra` open while it runs |
+
+Root work belongs in the image: the container's writable layer is lost on `recreate`, so there is
+no root setup hook.
+
+### Image layer
+
+Layers, bottom to top: the base (`image`, or the `devcontainer build` result), the **user layer**
+(below), then an optional `.agent-sandbox/Dockerfile` for sandbox-only additions. That Dockerfile
+starts with `ARG base` / `FROM $base`, gets the build args `user`, `uid`, `gid` and `home`, and is
+built with `.agent-sandbox/` as the context (never the workspace: agent-written files must not
+enter the build). The derived image's label carries the Dockerfile's hash, so a change rebuilds it
+and the spec hash makes the container drift. CA certificates go first when later steps need them
+(TLS-inspecting corporate proxies); for devcontainers they must be in the base image or the
+devcontainer's own Dockerfile, because Features run before our layers.
+
+User layer, in order. The devcontainer's remote user is resolved as the CLI does it
+(`containerFeatures.ts`): the last `remoteUser` in the metadata, else the last `containerUser`,
+else the image's `USER`, else `root`.
+1. a user with the host uid exists: use it, whatever its name (today's behaviour);
+2. the devcontainer's remote user is not root and exists: change its uid/gid to the host's in
+   `/etc/passwd` and `/etc/group` and `chown -R` its home (what the devcontainers CLI does in
+   `scripts/updateUID.Dockerfile`; a gid already taken keeps the old gid);
+3. the devcontainer's remote user is not root and does not exist (only possible when
+   `remoteUser`/`containerUser` names it; the CLI does not check): create our user under that name;
+4. a plain `image` project, or a devcontainer whose remote user is root: create our user as today.
+
+A base image without a digest (`image = "..."` in config.toml, or the devcontainer's base, see
+below) warns on every build, for consistency with the lockfile requirement: the spec hash notices a
+changed base, but not what changed, so only a digest lets the user audit it.
+
+Builds are not proxied: they run only approved, agent-unwritable inputs, which is the same trust
+as the user running `docker build`, and BuildKit only offers `default`/`host`/`none` networks to
+`RUN` steps. Host proxy variables are passed as build args as today.
+
+### Devcontainer source
+
+Opt-in per project: `config.toml` sets exactly one of `image = "..."` and `[devcontainer]
+enabled = true` (both, or neither, is an error). `[devcontainer] config` selects the file:
+`.devcontainer/devcontainer.json` (default) or `.devcontainer/<name>/devcontainer.json`. Purpose:
+people working in the project's dev container and the agent get the same environment.
+
+- **Everything the build reads must be agent-unwritable.** `.devcontainer/` is protected
+  implicitly, even when a project drops it from `[workspace] protected`. A `.devcontainer.json` in
+  the workspace root is rejected with a hint to move it to `.devcontainer/devcontainer.json`
+  (the CLI and VS Code accept both): the file alone could be protected (protected paths may be
+  files), but it conventionally comes with a Dockerfile and context in the workspace root, and the
+  approved inputs would be loose files among agent-written ones. A Dockerfile or a local Feature
+  outside `.devcontainer/` is an error for the same reason. A `build.context` outside it only warns:
+  the approved Dockerfile decides what is copied, but the copied files' contents come from the
+  agent.
+- **CLI**: the user's `devcontainer` (Node 20+). Which executable runs is a host decision, so it is
+  a user-config key (`devcontainer_cli`, a command list, default `["devcontainer"]`, e.g.
+  `["npx", "@devcontainers/cli"]`), never project config. Missing CLI: an error saying how to
+  install it. It is used only for `build`, `upgrade` (in printed instructions) and
+  `read-configuration`.
+- **Build**: `devcontainer build --workspace-folder ROOT --config PATH --frozen-lockfile
+  --image-name localhost/agent-sandbox/devcontainer-<id>:<hash of the approved tree>
+  --docker-path ENGINE`, result parsed from the JSON line on stdout. `rebuild` adds `--no-cache`.
+  Verified with CLI 0.90.0 on rootless docker: `build` never runs `initializeCommand` (only `up`
+  does), never remaps uids, installs each Feature's `install.sh` as root in a generated
+  Dockerfile (`buildx` with `--build-context`, a fallback without BuildKit exists), turns
+  `containerEnv` into image `ENV`, and fetches Features and
+  `containers.dev/static/devcontainer-control-manifest.json` over the host network. It sets no
+  proxy build args itself.
+- **Lockfile required**. Without `--frozen-lockfile` the CLI rewrites `devcontainer-lock.json`
+  whenever it differs, i.e. changes approved files behind the user's back; the lockfile pins
+  Features by digest, so it is what makes approving them meaningful. Both failures are reported
+  before anything is built and turned into instructions:
+  - `Lockfile does not exist.`: run `devcontainer upgrade --workspace-folder . [--config PATH]`,
+    review and commit `devcontainer-lock.json`, approve, retry;
+  - `Lockfile does not match.`: run the same with `--dry-run` (prints the new lockfile, writes
+    nothing) to compare, then without it.
+- **Unpinned base images warn** (see the image layer): an `image` without `@sha256:` in the
+  devcontainer config, or a `FROM` without a digest in its Dockerfile. The lockfile does not cover
+  them.
+- **Approval** covers the whole `.devcontainer/` tree (configs, lockfiles, Dockerfiles, local
+  Features, also those shared between named configs) as a tree diff.
+- **What applies** comes from the built image's `devcontainer.metadata` label: a JSON array with
+  one entry per Feature (carrying its `id`) in install order and the devcontainer.json entry last,
+  with `${...}` variables **unsubstituted**. Keys that only exist in devcontainer.json
+  (`initializeCommand`, `runArgs`, `workspaceMount`, ...) are not in the label; warnings about
+  them read `devcontainer read-configuration` (parsed JSONC, but already substituted with the host
+  environment, so it is used for nothing else).
+
+| Key | Handling |
+|---|---|
+| `containerEnv` | already `ENV` in the image |
+| `remoteEnv` | exec environment (merged in label order; `[env]` from config.toml wins) |
+| `remoteUser` | user layer, see above; `containerUser` is ignored |
+| `onCreateCommand`, `updateContentCommand`, `postCreateCommand` | setup layer, create phase |
+| `postStartCommand` | setup layer, every container start |
+| `postAttachCommand` | before each harness start (plain `agent-sandbox`, not `exec`/`root`); failures warn |
+| `privileged`, `capAdd`, `securityOpt`, `mounts`, Feature `entrypoint` | not applied; a warning names the Feature (e.g. docker-in-docker: installed, but its daemon will not run) |
+| `initializeCommand`, `runArgs`, `workspaceMount`, `appPort` | not applied, warned |
+| `workspaceFolder` other than the mirrored path | warned; commands run in the mirrored path |
+| `init` | always on anyway |
+| `forwardPorts`, `portsAttributes`, `hostRequirements`, `customizations`, `shutdownAction` | ignored |
+| `dockerComposeFile` | error: not supported |
+
+Variables in commands and `remoteEnv`: `${localWorkspaceFolder}` and `${containerWorkspaceFolder}`
+are both the workspace path (mirrored), likewise their `...Basename` forms; `${containerEnv:NAME}`
+comes from the image; `${localEnv:NAME[:default]}` resolves only names listed in `[env] pass`,
+others become the default (or empty) with a warning; anything else is left as is with a warning.
+
+### Setup layer
+
+- Sources: `[setup] create = [...]` and `[setup] start = [...]` in config.toml (each entry a shell
+  command, run with `sh -c` in order), then the devcontainer lifecycle commands mapped above.
+  Devcontainer command forms: a string runs with `sh -c`, an array runs directly, an object runs
+  its named commands in parallel with output prefixed by the name. Per hook, label order (Features
+  first). Every command is a separate process, as in the CLI (`runRemoteCommand` with
+  `/bin/sh -c` or the array, on a PTY), so nothing it exports reaches the harness; that holds for
+  `postAttachCommand` too.
+- Runs as the sandbox user with the normal exec environment, in the workspace root, through the
+  proxy with the `net` tier open for its duration (a scoped `net` session; an active `net` session
+  is reused). It cannot have a direct route: the workspace (agent-written, e.g. dependency build
+  hooks) and the state volumes (harness credentials) are already mounted.
+- Success is recorded on the host (state dir, keyed by container id) only after every create
+  command succeeded, together with a hash of the commands. A new container (`recreate`) has no
+  record.
+- **Automatic**: a harness start (plain `agent-sandbox`) without a matching record runs the create
+  phase first, under a header saying so (it can take long). This needs no separate consent: the
+  only extra network is `allow.extra`, already approved, and only while setup runs, before any
+  harness runs in the container. `exec` and `root` never trigger it and work without a record
+  (debugging).
+- Fail, inspect, allow, rerun: blocked hosts are logged live and listed at the end with the same
+  promotion prompt as `net`, followed by "retry now?" (TTY only). Otherwise the harness is not
+  started and the message says to run `agent-sandbox setup`, which reruns the create phase without
+  a `recreate`, so commands must be idempotent (`uv sync`, `poetry sync` and
+  `pre-commit install-hooks` are).
+- The start phase runs whenever the CLI starts the workspace container; failures warn.
+- `pre-commit install` does not belong here: it writes `.git/hooks/pre-commit`, which host git
+  executes, and with `.git` shared with the host it changes nothing that a host-side install has not
+  done. `pre-commit install-hooks` (fills `~/.cache/pre-commit`, a state path) is the useful part
+  and works with a read-only `.git`.
+
+### Open questions
+
+- `devcontainer build` on podman (`--docker-path podman`) is untested; to be done in the podman
+  verification session.
+
+## 7. Commands
 
 | Command | Behaviour |
 |---|---|
@@ -263,6 +416,7 @@ with the list of changed keys and tells the user to run `recreate`.
 | `rm [NAME] [--state]` | remove containers, network, runtime dir; keeps state and isolated volumes unless `--state`; never touches workspace files |
 | `recreate` | remove containers and network (keeps state and isolated volumes), then create again |
 | `rebuild [--pull]` | rebuild derived and proxy images (then `recreate`) |
+| `setup` | (planned, section 6) rerun the setup create phase in the running container |
 | `ls` | all sandboxes on all engines, orphans flagged |
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
 | `status` | state, approval, drift, proxy tier and time left |
@@ -273,7 +427,7 @@ with the list of changed keys and tells the user to run `recreate`.
 Rules: running in a subdirectory of a repo is an error; per-project lock (flock) serialises creation;
 creation rolls back what it created on failure; at most one network session per workspace.
 
-## 7. Safety checks
+## 8. Safety checks
 
 - Extra mount sources must exist, may not be sockets/devices, and may not be (or contain, or be inside)
   sensitive trees (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gcloud`,
@@ -289,7 +443,7 @@ creation rolls back what it created on failure; at most one network session per 
   type `I understand the risks`.
 - SELinux + podman: `relabel=shared` on the workspace mount.
 
-## 8. Harness facts used for defaults
+## 9. Harness facts used for defaults
 
 - Claude Code: required hosts `api.anthropic.com`, `claude.ai`, `platform.claude.com`; optional
   `downloads.claude.ai`, `mcp-proxy.anthropic.com`, `registry.npmjs.org`. State: `~/.claude/` and
@@ -309,7 +463,7 @@ creation rolls back what it created on failure; at most one network session per 
 - uv: `uv sync` and `uv venv --clear` work when `.venv` is a volume mount point (they clear the
   contents instead of removing the directory; checked with uv 0.13.4).
 
-## 9. Testing
+## 10. Testing
 
 - Unit tests (pytest, no engine): config parsing/validation, durations, allowlist and NO_PROXY parsing,
   Upstream/Filter generation incl. allow-all ordering, log parsing, derived tag naming, spec hashing,
@@ -329,7 +483,7 @@ creation rolls back what it created on failure; at most one network session per 
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
 
-## 10. Design decisions and rejected alternatives
+## 11. Design decisions and rejected alternatives
 
 - **Shared in-project venv** (mirror paths and mount uv's interpreter directory at its host path):
   rejected. A venv hardcodes the project path (shebangs, `activate`, editable `.pth` files) and the
@@ -366,9 +520,29 @@ creation rolls back what it created on failure; at most one network session per 
   `settings.local.json` and the agent the ability to write project skills/commands directly; it
   drafts them elsewhere and the user promotes them. A project can drop entries from `protected`.
 
-## 11. Deferred / out of scope for v1
+- **The devcontainers CLI owning the container** (`devcontainer up`): rejected. devcontainer.json
+  trusts the repository: `initializeCommand` runs on the host, and `runArgs`, `mounts`,
+  `privileged`, `capAdd` and `securityOpt` would undo the isolation, so the file would have to be
+  filtered anyway; mounts, ownership, labels and drift detection would have to pass through
+  generated overrides; `stop`/`down` are missing. The CLI only builds images (section 6).
+- **`devcontainer set-up` / `run-user-commands` for lifecycle commands**: rejected. They write the
+  "already ran" marker before running the command (`injectHeadless.ts`), so a failed
+  `postCreateCommand` is skipped on retry; they patch `/etc/environment` and `/etc/profile` as root
+  and pass the proxy variables only via `--remote-env`. The command format is small enough to run
+  ourselves.
+- **Installing devcontainer Features natively** (fetching the OCI artifacts without the CLI):
+  rejected for now. The point of devcontainer support is parity with people using the dev
+  container, and reimplementing option defaults, `installsAfter` ordering and the `_REMOTE_USER*`
+  variables would drift from the CLI.
+- **Setup hooks with an unrestricted network**: rejected. When they run, agent-written workspace
+  files and the harness credentials in the state volumes are mounted, and installers execute
+  dependency hooks the agent may have planted.
+- **Proxying image builds**: not done. Builds run approved inputs only, and BuildKit cannot attach
+  `RUN` steps to the internal network.
 
-OpenCode defaults; modular "what to install at creation"; replacing the user's separate
+## 12. Deferred / out of scope for v1
+
+OpenCode defaults; environment setup (designed in section 6, not implemented); replacing the user's separate
 `workspace-sandbox` scripts (to be revisited after solo testing); Podman and rootful verification;
 Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
 user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
