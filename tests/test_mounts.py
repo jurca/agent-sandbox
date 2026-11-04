@@ -198,10 +198,17 @@ def test_apply_acls_skips_git_and_config(repo: Path) -> None:
             ["getfacl", "-n", "-p", "-c", str(path)], capture_output=True, text=True, check=True
         ).stdout
 
-    assert f"user:{other}:rw" in acl(repo / "src" / "a.py")
+    def access(path: Path) -> list[str]:
+        return [line for line in acl(path).splitlines() if not line.startswith("default:")]
 
+    me = os.getuid()
+    # Symmetric: a copy of a file's ACL (atomic replace) must still name the host user.
+    assert f"user:{other}:rw-" in access(repo / "src" / "a.py")
+    assert f"user:{me}:rw-" in access(repo / "src" / "a.py")
+    assert f"user:{other}:rwx" in access(repo / "src")
+    assert f"user:{me}:rwx" in access(repo / "src")
     assert f"default:user:{other}:rwx" in acl(repo / "src")
-    assert f"default:user:{os.getuid()}:rwx" in acl(repo / "src")
+    assert f"default:user:{me}:rwx" in acl(repo / "src")
     for skipped in (repo / ".git", repo / ".git" / "HEAD", repo / ".agent-sandbox" / "config.toml"):
         assert str(other) not in acl(skipped), skipped
     assert str(other) not in acl(Path("/etc/hostname"))
@@ -242,3 +249,47 @@ def test_walk_for_acls_skips_relative_paths(tmp_path: Path) -> None:
         "src",
     ]
     assert files == [str(tmp_path / "backend" / "src" / "a.py")]
+
+
+@needs_acl
+def test_has_workspace_acl_needs_the_host_user_entry(tmp_path: Path) -> None:
+    other = os.getuid() + 12345
+    assert mounts.apply_acls(tmp_path, other) == 0
+    assert mounts.has_workspace_acl(tmp_path, other)
+    # Workspaces shared by older versions only named the sandbox user.
+    subprocess.run(["setfacl", "-x", f"u:{os.getuid()}", str(tmp_path)], check=True)
+    assert not mounts.has_workspace_acl(tmp_path, other)
+
+
+def test_walk_for_acls_lists_unreadable_dirs(tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    (locked / "inner").mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        dirs, _files = mounts._walk_for_acls(tmp_path, frozenset())
+    finally:
+        locked.chmod(0o700)
+    assert sorted(dirs) == [str(tmp_path), str(locked)]
+
+
+def test_foreign_paths(tmp_path: Path) -> None:
+    me, group = os.getuid(), os.getgid()
+    for rel in ("src", "skip/deep", "locked/inner"):
+        (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / "src" / "a.py").write_text("")
+    (tmp_path / "skip" / "deep" / "b.py").write_text("")
+    (tmp_path / "link").symlink_to("/etc/hostname")
+    assert mounts.foreign_paths(tmp_path, frozenset({"skip"}), me, group) == []
+    locked = tmp_path / "locked"
+    locked.chmod(0)
+    try:
+        listed = mounts.foreign_paths(tmp_path, frozenset({"skip"}), me + 1, group)
+        by_group = mounts.foreign_paths(tmp_path, frozenset({"skip"}), me, group + 1)
+    finally:
+        locked.chmod(0o700)
+    expected = sorted(
+        [str(tmp_path), *(str(tmp_path / rel) for rel in ("src", "src/a.py", "locked"))]
+    )
+    # Symlinks are never listed (nor followed); unreadable directories are, without contents.
+    assert sorted(listed) == expected
+    assert sorted(by_group) == sorted(listed)

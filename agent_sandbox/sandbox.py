@@ -32,7 +32,9 @@ from .mounts import (
     BindMount,
     VolumeMount,
     apply_acls,
+    batches,
     ensure_mountpoint,
+    foreign_paths,
     scan_for_sockets,
     validate_extra_mounts,
     workspace_path,
@@ -320,7 +322,8 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         if failed:
             eprint(
                 f"warning: {failed} path(s) in the workspace could not be given the sandbox "
-                "user's access (not owned by you?)."
+                "user's access (not owned by you?). If an earlier sandbox created them, run "
+                "`agent-sandbox repair` once this one is running."
             )
 
     created: list[tuple[str, str]] = []
@@ -389,13 +392,75 @@ def share_workspace(ctx: Context, plan: Plan, host_uid: int) -> int:
     """
     if host_uid == os.getuid():
         return 0
+    return sum(apply_acls(root, host_uid, skip=skip) for root, skip in shared_trees(ctx, plan))
+
+
+def shared_trees(ctx: Context, plan: Plan) -> list[tuple[Path, tuple[str, ...]]]:
+    """Host trees the sandbox user may write, each with the paths (relative to it) to skip."""
     skip = (PROJECT_DIR, *ctx.config.protected, *ctx.config.isolated)
     if ctx.git_mode != "rw":
-        return apply_acls(ctx.project.root, host_uid, skip=(".git", *skip))
-    failed = apply_acls(ctx.project.root, host_uid, skip=skip)
-    for git_dir in plan.layout.external_dirs:
-        failed += apply_acls(git_dir, host_uid, skip=())
-    return failed
+        return [(ctx.project.root, (".git", *skip))]
+    return [(ctx.project.root, skip), *((d, ()) for d in plan.layout.external_dirs)]
+
+
+# `find -maxdepth 0` tests each listed path itself (never its contents) as the container sees
+# it and does not follow symlinks; `chown -h` changes a symlink, not its target. Prints what
+# it changed so the caller knows which unreadable directories may be listable now.
+_RECLAIM = r"""
+uid=$1 gid=$2 to_uid=$3 to_gid=$4; shift 4
+find "$@" -maxdepth 0 -user "$uid" -print -exec chown -h "$to_uid" {} +
+find "$@" -maxdepth 0 -group "$gid" -print -exec chown -h ":$to_gid" {} +
+"""
+
+
+def reclaim_workspace(ctx: Context, plan: Plan) -> tuple[int, int]:
+    """Hand workspace files owned by the sandbox user back to the host user.
+
+    Only a file's owner may change its ACL, so files the sandbox user owns (created or replaced
+    in the sandbox) are out of reach for `apply_acls` on the host. The ids are observed instead
+    of computed from /proc/self/uid_map, which is relative to the parent user namespace (podman's
+    own one for rootless podman): `.agent-sandbox` is owned by the host user and read-only
+    inside, so its owner as `stat` reports it inside the container is the host user's id there.
+    Returns (paths reclaimed, failures).
+    """
+    engine, project = ctx.engine, ctx.project
+    reference = project.root / PROJECT_DIR
+    info = reference.lstat()
+    if info.st_uid != os.getuid():
+        raise SandboxError(f"{reference} is not owned by you; cannot tell whom to give files to.")
+    seen = engine.run("exec", project.workspace_container, "stat", "-c", "%u %g", str(reference))
+    to_uid, to_gid = (int(part) for part in seen.stdout.split())
+    if to_uid == ctx.uid:
+        # The sandbox user is the host user (rootful, keep-id); the group alone (a setgid
+        # project directory) is no reason to touch the user's own files.
+        return 0, 0
+    trees = shared_trees(ctx, plan)
+    attempted: set[str] = set()
+    reclaimed = failed = 0
+    while True:
+        # A reclaimed directory the host could not read before may reveal more files.
+        pending = [
+            path
+            for root, skip in trees
+            for path in foreign_paths(root, frozenset(skip), info.st_uid, info.st_gid)
+            if path not in attempted
+        ]
+        if not pending:
+            break
+        attempted.update(pending)
+        changed: set[str] = set()
+        for batch in batches(pending):
+            result = engine.run(
+                "exec", "--user", "0", project.workspace_container, "sh", "-c", _RECLAIM,
+                "sh", str(ctx.uid), str(ctx.gid), str(to_uid), str(to_gid), *batch,
+                check=False,
+            )  # fmt: skip
+            changed.update(line for line in result.stdout.splitlines() if line)
+            failed += len([line for line in result.stderr.splitlines() if line.strip()])
+        if not changed:
+            break
+        reclaimed += len(changed)
+    return reclaimed, failed
 
 
 def fix_state_ownership(ctx: Context, home: str) -> None:

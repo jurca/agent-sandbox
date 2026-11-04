@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -375,3 +377,119 @@ def test_outdated_proxy_is_replaced(configured: Path) -> None:
     engine.add("container", p.proxy_container, {}, Image="sha256:new")
     assert not sandbox.ensure_proxy_container(ctx, "proxy:2")
     assert not any(c[0] in ("rm", "create") for c in engine.calls)
+
+
+# --- reclaiming files owned by the sandbox user -----------------------------------------
+
+
+ReclaimAnswer = subprocess.CompletedProcess[str] | str
+
+
+def reclaim_engine(
+    ctx: Context, inside: str, reclaim: Callable[[list[str]], ReclaimAnswer]
+) -> FakeEngine:
+    """`inside` is how the container sees `.agent-sandbox`; `reclaim` answers the root exec."""
+    engine = ctx.engine
+    assert isinstance(engine, FakeEngine)
+    ws = ctx.project.workspace_container
+    engine.on(("exec", ws, "stat", "-c", "%u %g"), lambda args: inside + "\n")
+    engine.on(("exec", "--user", "0", ws, "sh", "-c"), lambda args: reclaim(list(args[12:])))
+    return engine
+
+
+def root_execs(engine: FakeEngine, ctx: Context) -> list[tuple[str, ...]]:
+    prefix = ("exec", "--user", "0", ctx.project.workspace_container)
+    return [c for c in engine.calls if c[:4] == prefix]
+
+
+def test_reclaim_hands_sandbox_files_back_to_the_host_user(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_ctx(configured)
+    listed = [str(configured / "a.txt"), str(configured / "d")]
+    walks: list[tuple[Path, frozenset[str], int, int]] = []
+
+    def fake_foreign(root: Path, exclude: frozenset[str], uid: int, gid: int) -> list[str]:
+        walks.append((root, exclude, uid, gid))
+        return listed
+
+    monkeypatch.setattr(sandbox, "foreign_paths", fake_foreign)
+    engine = reclaim_engine(ctx, "0 0", lambda paths: "".join(f"{p}\n" for p in paths))
+    assert sandbox.reclaim_workspace(ctx, make_plan(ctx)) == (2, 0)
+    reference = (configured / ".agent-sandbox").lstat()
+    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
+    assert walks[0] == (configured, frozenset((".git", *covered)), os.getuid(), reference.st_gid)
+    stat_call = ("exec", ctx.project.workspace_container, "stat", "-c", "%u %g",
+                 str(configured / ".agent-sandbox"))  # fmt: skip
+    assert stat_call in engine.calls
+    (call,) = root_execs(engine, ctx)
+    # Sandbox user and group as the container sees them, then the host user's inside ids.
+    assert call[7:12] == ("sh", "1000", "1000", "0", "0")
+    assert list(call[12:]) == listed
+    script = call[6]
+    assert "-maxdepth 0" in script and "chown -h" in script and "-user" in script
+    assert "-group" in script
+
+
+@pytest.mark.parametrize(
+    ("engine_kind", "inside"),
+    # A setgid project directory may give `.agent-sandbox` another group: only the uid decides.
+    [
+        ("docker-rootful", "1000 1000"),
+        ("podman-keep-id", "1000 1000"),
+        ("docker-rootful", "1000 50"),
+    ],
+)
+def test_reclaim_is_a_no_op_when_the_sandbox_user_is_the_host_user(
+    configured: Path, monkeypatch: pytest.MonkeyPatch, engine_kind: str, inside: str
+) -> None:
+    kind, _, mode = engine_kind.partition("-")
+    ctx = make_ctx(configured, FakeEngine(kind, rootless=mode != "rootful"))
+    monkeypatch.setattr(sandbox, "foreign_paths", lambda *a: pytest.fail("walked the workspace"))
+    engine = reclaim_engine(ctx, inside, lambda paths: pytest.fail("reclaimed"))
+    assert sandbox.reclaim_workspace(ctx, make_plan(ctx)) == (0, 0)
+    assert root_execs(engine, ctx) == []
+
+
+def test_reclaim_lists_again_what_reclaiming_made_readable(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_ctx(configured)
+    locked, inner = str(configured / "locked"), str(configured / "locked" / "f")
+    rounds = [[locked], [locked, inner], [locked, inner]]
+    monkeypatch.setattr(sandbox, "foreign_paths", lambda *a: rounds.pop(0))
+    engine = reclaim_engine(ctx, "0 0", lambda paths: "".join(f"{p}\n" for p in paths))
+    assert sandbox.reclaim_workspace(ctx, make_plan(ctx)) == (2, 0)
+    assert [list(c[12:]) for c in root_execs(engine, ctx)] == [[locked], [inner]]
+
+
+def test_reclaim_stops_when_nothing_changes(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_ctx(configured)
+    stuck = [str(configured / "stuck")]
+    monkeypatch.setattr(sandbox, "foreign_paths", lambda *a: list(stuck))
+    failing = subprocess.CompletedProcess([], 1, "", "chown: stuck: Operation not permitted\n")
+    engine = reclaim_engine(ctx, "0 0", lambda paths: failing)
+    assert sandbox.reclaim_workspace(ctx, make_plan(ctx)) == (0, 1)
+    assert len(root_execs(engine, ctx)) == 1
+
+
+def test_reclaim_covers_git_dirs_only_when_rw(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    git(repo, "worktree", "add", "-q", str(tree))
+    manage.init_project(project_for(tree.resolve()), IMAGE)
+    roots: list[tuple[Path, frozenset[str]]] = []
+
+    def fake_foreign(root: Path, exclude: frozenset[str], uid: int, gid: int) -> list[str]:
+        roots.append((root, exclude))
+        return []
+
+    monkeypatch.setattr(sandbox, "foreign_paths", fake_foreign)
+    rw = make_ctx(tree.resolve(), user=UserConfig(git="rw"))
+    reclaim_engine(rw, "0 0", lambda paths: "")
+    sandbox.reclaim_workspace(rw, make_plan(rw))
+    covered = (".agent-sandbox", ".claude", ".agents", ".vscode", ".idea", ".venv", "node_modules")
+    assert roots == [(tree.resolve(), frozenset(covered)), (repo / ".git", frozenset())]

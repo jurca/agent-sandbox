@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_sandbox import images
-from agent_sandbox.images import Probe, derived_tag, host_uid_for, parse_probe
+from agent_sandbox.images import Probe, derived_tag, host_uid_for, parse_probe, parse_uid_map
 from agent_sandbox.util import SandboxError
 
 DIGEST = "sha256:" + "ab12" * 16
@@ -57,6 +57,12 @@ def test_host_uid_for_rootless_docker() -> None:
     assert host_uid_for(uid_map, 1) == 100000
     with pytest.raises(SandboxError):
         host_uid_for(uid_map, 65537)
+
+
+def test_parse_uid_map() -> None:
+    text = "         0       1000          1\n         1     100000      65536\n\n"
+    assert parse_uid_map(text) == ((0, 1000, 1), (1, 100000, 65536))
+    assert parse_uid_map("") == ()
 
 
 def test_host_uid_for_identity_and_keep_id() -> None:

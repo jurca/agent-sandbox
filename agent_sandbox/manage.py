@@ -21,7 +21,7 @@ from .config import (
     load_user_config,
 )
 from .engine import Engine, probe_engines
-from .images import host_uid_for
+from .images import host_uid_for, parse_uid_map
 from .mounts import has_workspace_acl
 from .net import owner_alive
 from .project import (
@@ -41,6 +41,7 @@ from .sandbox import (
     container_home,
     fix_state_ownership,
     make_plan,
+    reclaim_workspace,
     remove_by_id,
     share_workspace,
     spec_hash,
@@ -290,16 +291,14 @@ def doctor(ctx: Context) -> int:
         result = engine.run(
             "exec", project.workspace_container, "cat", "/proc/self/uid_map", check=False
         )
-        mapping = tuple(
-            (int(a), int(b), int(c))
-            for a, b, c in (ln.split() for ln in result.stdout.splitlines() if ln.strip())
-        )
+        mapping = parse_uid_map(result.stdout)
         if mapping:
             host_uid = host_uid_for(mapping, ctx.uid)
             if host_uid != os.getuid():
                 report(
                     has_workspace_acl(project.root, host_uid),
-                    f"workspace ACL grants host uid {host_uid} (the sandbox user) access",
+                    f"workspace ACL grants host uid {host_uid} (the sandbox user) and you access"
+                    " (if not: `agent-sandbox repair`)",
                 )
     proxy_uid = engine.run("exec", project.proxy_container, "id", "-u", check=False).stdout.strip()
     proxy_mounts = (engine.inspect("container", project.proxy_container) or {}).get("Mounts")
@@ -350,20 +349,27 @@ def repair(ctx: Context) -> None:
     engine, project = ctx.engine, ctx.project
     if not owner_alive(ctx):
         proxyctl.clear_deadline(engine, project)
-    if engine.kind == "docker" and engine.rootless:
-        if engine.container_status(project.workspace_container) != "running":
-            raise SandboxError("Start the sandbox first (`agent-sandbox`), then run repair.")
-        result = engine.run("exec", project.workspace_container, "cat", "/proc/self/uid_map")
-        mapping = tuple(
-            (int(a), int(b), int(c))
-            for a, b, c in (ln.split() for ln in result.stdout.splitlines() if ln.strip())
-        )
-        host_uid = host_uid_for(mapping, ctx.uid)
-        if host_uid != os.getuid():
-            failed = share_workspace(ctx, make_plan(ctx, container_home(ctx)), host_uid)
-            eprint(f"Re-applied workspace ACLs ({failed} path(s) could not be changed).")
-    if engine.container_status(project.workspace_container) == "running":
-        fix_state_ownership(ctx, container_home(ctx))
+    running = engine.container_status(project.workspace_container) == "running"
+    acl = engine.kind == "docker" and engine.rootless
+    if acl and not running:
+        raise SandboxError("Start the sandbox first (`agent-sandbox`), then run repair.")
+    if running:
+        home = container_home(ctx)
+        plan = make_plan(ctx, home)
+        # First, so that the host owns (and may set ACLs on) what the sandbox user created.
+        reclaimed, failed = reclaim_workspace(ctx, plan)
+        if reclaimed or failed:
+            eprint(
+                f"Gave {reclaimed} workspace path(s) owned by the sandbox user back to you"
+                + (f" ({failed} could not be changed)." if failed else ".")
+            )
+        if acl:
+            result = engine.run("exec", project.workspace_container, "cat", "/proc/self/uid_map")
+            host_uid = host_uid_for(parse_uid_map(result.stdout), ctx.uid)
+            if host_uid != os.getuid():
+                failed = share_workspace(ctx, plan, host_uid)
+                eprint(f"Re-applied workspace ACLs ({failed} path(s) could not be changed).")
+        fix_state_ownership(ctx, home)
         eprint("Reset ownership of the harness state directories.")
     eprint("Done.")
 

@@ -98,6 +98,14 @@ def parse_probe(output: str) -> Probe:
     return Probe(name, gid, home, shell, home_ok, has_bash, tuple(uid_map))
 
 
+def parse_uid_map(text: str) -> tuple[tuple[int, int, int], ...]:
+    """The lines of /proc/self/uid_map as (inside, outside, count)."""
+    return tuple(
+        (int(a), int(b), int(c))
+        for a, b, c in (ln.split() for ln in text.splitlines() if ln.strip())
+    )
+
+
 def host_uid_for(uid_map: tuple[tuple[int, int, int], ...], container_uid: int) -> int:
     """The host uid a container uid corresponds to (identity when the engine has no mapping)."""
     for inside, outside, count in uid_map:

@@ -128,3 +128,41 @@ def test_repair_keeps_live_net_session(repo: Path, monkeypatch: pytest.MonkeyPat
     (proxyctl.runtime_path(ctx.project) / "net.pid").write_text("999999999")
     manage.repair(ctx)
     assert proxyctl.read_deadline(ctx.project) is None
+
+
+def test_repair_reclaims_before_reapplying_acls(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from .test_sandbox import make_ctx
+
+    engine = FakeEngine("docker")
+    ctx = make_ctx(repo, engine)
+    ws = ctx.project.workspace_container
+    engine.add("container", ws, {}, State={"Status": "running"})
+    engine.on(("exec", ws, "cat", "/proc/self/uid_map"), lambda args: "0 1000 1\n1 100000 65536\n")
+    steps: list[str] = []
+    monkeypatch.setattr(manage, "reclaim_workspace", lambda c, p: steps.append("reclaim") or (3, 0))
+    monkeypatch.setattr(
+        manage, "share_workspace", lambda c, p, uid: steps.append(f"acl {uid}") or 0
+    )
+    monkeypatch.setattr(manage, "fix_state_ownership", lambda c, h: steps.append("state"))
+    monkeypatch.setattr(manage, "container_home", lambda c: "/home/dev")
+    manage.repair(ctx)
+    assert steps == ["reclaim", "acl 100999", "state"]
+
+
+def test_repair_reclaims_on_other_engines_too(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from .test_sandbox import make_ctx
+
+    engine = FakeEngine("podman")
+    ctx = make_ctx(repo, engine)
+    steps: list[str] = []
+    monkeypatch.setattr(manage, "reclaim_workspace", lambda c, p: steps.append("reclaim") or (0, 0))
+    monkeypatch.setattr(manage, "share_workspace", lambda c, p, uid: pytest.fail("no ACLs"))
+    monkeypatch.setattr(manage, "fix_state_ownership", lambda c, h: steps.append("state"))
+    monkeypatch.setattr(manage, "container_home", lambda c: "/home/dev")
+    manage.repair(ctx)
+    assert steps == []  # not running: nothing to reclaim
+    engine.add("container", ctx.project.workspace_container, {}, State={"Status": "running"})
+    manage.repair(ctx)
+    assert steps == ["reclaim", "state"]

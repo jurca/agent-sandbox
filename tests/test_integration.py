@@ -402,6 +402,43 @@ def test_repair_restores_acls(env: Env, workspace: Path) -> None:
     target.unlink()
 
 
+def test_file_replaced_in_the_sandbox_stays_writable_on_the_host(env: Env, workspace: Path) -> None:
+    target = workspace / "replaced.txt"
+    target.write_text("hello\n")
+    # GNU sed -i writes a temp file, copies the old file's ACL onto it and renames it.
+    sh(env, workspace, "sed -i s/hello/bye/ replaced.txt")
+    assert target.read_text() == "bye\n"
+    assert target.stat().st_uid != os.getuid()  # owned by the sandbox user's sub-uid now
+    with target.open("a") as handle:
+        handle.write("host\n")
+    target.unlink()
+
+
+def test_repair_reclaims_files_the_host_cannot_change(env: Env, workspace: Path) -> None:
+    # A sandbox-owned file without the host user's ACL entry (as left by older versions or a
+    # chmod), inside a directory the host cannot even read.
+    sh(
+        env,
+        workspace,
+        "mkdir -p reclaim/locked && echo x > reclaim/locked/f && echo y > reclaim/g && "
+        "python3 -c \"import os; os.removexattr('reclaim/g', 'system.posix_acl_access')\" && "
+        "chmod 644 reclaim/g && chmod 700 reclaim/locked",
+    )
+    base = workspace / "reclaim"
+    assert not os.access(base / "g", os.W_OK)
+    assert not os.access(base / "locked", os.R_OK)
+    ok(env, workspace, "repair")
+    for rel in ("g", "locked", "locked/f"):
+        info = (base / rel).lstat()
+        assert (info.st_uid, info.st_gid) == (os.getuid(), os.getgid()), rel
+    (base / "g").write_text("host\n")
+    (base / "locked" / "f").write_text("host\n")
+    assert sh(env, workspace, "echo s >> reclaim/g && echo s >> reclaim/locked/f && echo ok") == (
+        "ok\n"
+    )
+    shutil.rmtree(base)
+
+
 def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
     config = workspace / ".agent-sandbox" / "config.toml"
     original = config.read_text()

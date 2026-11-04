@@ -182,24 +182,52 @@ def acl_tools_available() -> bool:
 
 
 def _walk_for_acls(root: Path, exclude: frozenset[str]) -> tuple[list[str], list[str]]:
-    """Directories and regular files below `root`, minus `exclude` (paths relative to root)."""
-    dirs: list[str] = []
+    """Directories and regular files below `root`, minus `exclude` (paths relative to root).
+
+    Symlinks are neither listed nor followed. A directory that cannot be read is listed (its
+    owner may still change its ACL) but its contents are not.
+    """
+    dirs: list[str] = [str(root)]
     files: list[str] = []
     for current, dirnames, filenames in os.walk(root, followlinks=False):
         rel = os.path.relpath(current, root)
         prefix = "" if rel == "." else rel + "/"
-        dirnames[:] = [d for d in dirnames if prefix + d not in exclude]
-        filenames[:] = [f for f in filenames if prefix + f not in exclude]
-        dirs.append(current)
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if prefix + d not in exclude and not os.path.islink(os.path.join(current, d))
+        ]
+        dirs.extend(os.path.join(current, d) for d in dirnames)
         for name in filenames:
+            if prefix + name in exclude:
+                continue
             path = os.path.join(current, name)
-            if stat.S_ISREG(os.lstat(path).st_mode):
-                files.append(path)
-        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(current, d))]
+            try:
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    files.append(path)
+            except OSError:
+                continue
     return dirs, files
 
 
-def _batches(items: list[str]) -> Iterator[list[str]]:
+def foreign_paths(root: Path, exclude: frozenset[str], uid: int, gid: int) -> list[str]:
+    """Directories and regular files below `root` not owned by `uid` or not in group `gid`.
+
+    Same selection as the ACL walk (`exclude` relative to root, symlinks never followed).
+    """
+    dirs, files = _walk_for_acls(root, exclude)
+    found: list[str] = []
+    for path in [*dirs, *files]:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if info.st_uid != uid or info.st_gid != gid:
+            found.append(path)
+    return found
+
+
+def batches(items: list[str]) -> Iterator[list[str]]:
     for start in range(0, len(items), ACL_BATCH):
         yield items[start : start + ACL_BATCH]
 
@@ -214,9 +242,12 @@ def apply_acls(
     """Give the container user (as a host uid) access to the workspace through ACLs.
 
     Rootless docker maps container uid N to a sub-uid, so plain ownership cannot work.
-    Default ACLs keep access symmetric for files created later by either side. `.git` and
-    the config directory are skipped by default: they stay owned by the host user, which
-    makes them read-only for the container user. `skip` holds paths relative to `root`.
+    The ACLs are symmetric: both users are named in the access ACL of every path and in the
+    default ACL of every directory. Files created later by either side inherit both, and a
+    file the sandbox replaces (temp file + copied ACL + rename, as `sed -i` does) still names
+    the host user although the sub-uid owns it now. `.git` and the config directory are
+    skipped by default: they stay owned by the host user, which makes them read-only for the
+    container user. `skip` holds paths relative to `root`.
 
     Returns the number of paths setfacl could not change (e.g. files you do not own).
     """
@@ -228,7 +259,8 @@ def apply_acls(
         )
     dirs, files = _walk_for_acls(root, frozenset(skip))
     failed = 0
-    dir_spec = f"u:{container_host_uid}:rwX,d:u:{container_host_uid}:rwX,d:u:{me}:rwX"
+    users = (container_host_uid, me)
+    dir_spec = ",".join([*(f"u:{u}:rwX" for u in users), *(f"d:u:{u}:rwX" for u in users)])
     # Files get an explicit mask. Files created after the first run inherit the default
     # entries above as `rwx` (masked to `rw-` at creation); letting setfacl recalculate the
     # mask would then widen it to `rwx` and make them group-executable. `X` cannot decide
@@ -238,10 +270,10 @@ def apply_acls(
     plain: list[str] = []
     for path in files:
         (executable if os.lstat(path).st_mode & stat.S_IXUSR else plain).append(path)
-    exec_spec = f"u:{container_host_uid}:rwx,m::rwx"
-    plain_spec = f"u:{container_host_uid}:rw-,m::rw-"
+    exec_spec = ",".join([*(f"u:{u}:rwx" for u in users), "m::rwx"])
+    plain_spec = ",".join([*(f"u:{u}:rw-" for u in users), "m::rw-"])
     for spec, paths in ((dir_spec, dirs), (exec_spec, executable), (plain_spec, plain)):
-        for batch in _batches(paths):
+        for batch in batches(paths):
             result = subprocess.run(
                 ["setfacl", "-m", spec, "--", *batch], capture_output=True, text=True, check=False
             )
@@ -255,8 +287,15 @@ def apply_acls(
     return failed
 
 
-def has_workspace_acl(root: Path, container_host_uid: int) -> bool:
+def has_workspace_acl(root: Path, container_host_uid: int, *, my_uid: int | None = None) -> bool:
+    """Whether `root` carries the symmetric ACLs `apply_acls` sets."""
+    me = os.getuid() if my_uid is None else my_uid
     result = subprocess.run(
         ["getfacl", "-n", "-p", "-c", str(root)], capture_output=True, text=True, check=False
     )
-    return f"default:user:{container_host_uid}:rwx" in result.stdout
+    lines = {line.split("#", 1)[0].strip() for line in result.stdout.splitlines()}
+    return {
+        f"default:user:{container_host_uid}:rwx",
+        f"user:{container_host_uid}:rwx",
+        f"user:{me}:rwx",
+    } <= lines

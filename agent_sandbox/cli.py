@@ -62,7 +62,7 @@ COMMANDS
   prune [--keep-state]              Remove orphaned sandboxes, asking about each one.
   status                            Show state, approval and configuration drift.
   doctor                            Check isolation of a running sandbox.
-  repair                            Re-apply file access for the sandbox user.
+  repair                            Reclaim sandbox-owned files, re-apply access.
   help [config|network|security|COMMAND]
 
 OPTIONS
@@ -175,7 +175,9 @@ SECURITY NOTES
 - Network access is closed by default because agents, like people, can be manipulated (prompt
   injection). The design limits what a manipulated agent can reach instead of trusting it.
 - Rootless docker maps the container user to a sub-uid, so the workspace is shared with ACLs
-  (setfacl). Podman uses --userns=keep-id. Rootful engines need `allow_rootful = true`.
+  (setfacl) naming both you and the sandbox user. Podman uses --userns=keep-id. Rootful engines
+  need `allow_rootful = true`. If you cannot write a file the sandbox created or changed, run
+  `agent-sandbox repair`: it gives sandbox-owned files back to you and re-applies the ACLs.
 - Directories you mount may not contain unix sockets: a read-only mount still lets the
   sandbox connect to them. Override with the long flag only if you know what they are.
 """
@@ -225,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-state", action="store_true", help="keep their state volumes")
     add("status", "Show the state of this sandbox.")
     add("doctor", "Check the isolation of the running sandbox.")
-    add("repair", "Re-apply file access and ownership for the sandbox user.")
+    add("repair", "Reclaim sandbox-owned files, re-apply file access and ownership.")
     return parser
 
 

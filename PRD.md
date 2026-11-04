@@ -111,16 +111,42 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 
 - Podman rootless: `--userns=keep-id`.
 - Docker rootless: container uid N maps to a sub-uid on the host (uid 1000 appears as 100999), so
-  default ACLs (`setfacl`) give that host uid access; `.git`, `.agent-sandbox`, protected and
+  ACLs (`setfacl`) give that host uid access; `.git`, `.agent-sandbox`, protected and
   isolated paths are skipped (matched as paths relative to the workspace root, at any depth): the
   first three stay owned by the host user, and walking a host virtualenv the sandbox never sees would
   only cost time. With `git = "rw"`, `.git` and any
   external git dirs get the ACLs too (otherwise the rw mount would not be writable). The mapping is read from
   `/proc/self/uid_map` inside a container. Applied at creation and by `repair`.
+  - The ACLs are **symmetric**: every directory and file names *both* the sandbox user's host uid
+    and the host user, in the access ACL and (directories) in the default ACL. Tools that replace
+    a file (write a temp file, copy the old file's ACL onto it, rename it over the original; GNU
+    `sed -i` does this) leave a file owned by the sub-uid with the copied ACL. Had the copy named
+    only the sandbox user (the host user used to need no entry as the owner), the host user would
+    lose write access, and could not fix it either: only a file's owner may change its ACL.
+  - Remaining drift: the agent can `chmod` files it owns, which narrows the ACL mask and with it
+    the host user's named entry. `repair` fixes that.
 - Rootful engines: same uid; requires `allow_rootful = true` in the user config.
 - Volume roots (state paths and their parents under the container home, isolated paths
   themselves but not their workspace parents) are created root-owned by the engine and are chowned
   to the sandbox user from a root exec after creation and by `repair`.
+- **Reclaiming** (`repair`, any running engine): workspace files and directories owned by the
+  sandbox user (or its group) are handed back to the host user, so the host can re-apply the
+  ACLs. The ids come from observing both sides, not from map arithmetic, because
+  `/proc/self/uid_map` is relative to the parent user namespace (the host for docker, podman's own
+  namespace for rootless podman):
+  - the target owner and group are those of `.agent-sandbox/` (host-owned, read-only inside, the
+    host checks that it owns it): `stat` inside the container gives the ids passed to `chown`
+    (rootless docker: `0:0`). If the owner equals the sandbox user's uid (rootful, `keep-id`),
+    the sandbox user *is* the host user and there is nothing to reclaim (the group alone, e.g.
+    from a setgid project directory, is no reason to touch the user's files);
+  - the host lists directories and regular files (`lstat`, never following symlinks, with the
+    same skipped paths as the ACLs) whose owner or group differs from `.agent-sandbox/`'s; a root
+    exec passes them to `find -maxdepth 0 -user|-group <sandbox id> -exec chown -h ...`, so only
+    what the container sees as the sandbox user's changes and a path swapped for a symlink is not
+    followed.
+  Directories the host could not read are listed again once they were reclaimed. The sandbox user
+  keeps access through its named ACL entry. Reclaiming, then re-applying the ACLs, also restores
+  what a `chmod` narrowed.
 
 ## 4. Configuration
 
@@ -240,7 +266,7 @@ with the list of changed keys and tells the user to run `recreate`.
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
 | `status` | state, approval, drift, proxy tier and time left |
 | `doctor` | live isolation checks (no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
-| `repair` | re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
+| `repair` | reclaim workspace files owned by the sandbox user's sub-uid, re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
 | `help [config|network|security|COMMAND]` | built-in help is the single source of documentation |
 
 Rules: running in a subdirectory of a repo is an error; per-project lock (flock) serialises creation;
@@ -286,10 +312,13 @@ creation rolls back what it created on failure; at most one network session per 
 
 - Unit tests (pytest, no engine): config parsing/validation, durations, allowlist and NO_PROXY parsing,
   Upstream/Filter generation incl. allow-all ordering, log parsing, derived tag naming, spec hashing,
-  uid-map arithmetic, mount validation, socket scan, approval, argument parsing, probe parsing.
+  uid-map arithmetic, symmetric ACLs, the reclaim walk, the reclaim `chown` ids and its no-op when
+  the sandbox user is the host user, mount validation, socket scan, approval, argument parsing, probe parsing.
 - Integration tests (marked `integration`, opt-in with `pytest --integration`, on the user's rootless
   docker, using temp repos under `/tmp/asb-it-*` and isolated `AGENT_SANDBOX_*_DIR`; no image pulls, so
-  the base image must be local): create and exec, ownership/ACL, read-only `.git`, tiers via
+  the base image must be local): create and exec, ownership/ACL, a file replaced by `sed -i` in the
+  sandbox stays writable on the host, `repair` reclaims a sub-uid-owned file the host cannot write,
+  read-only `.git`, tiers via
   `CONNECT`/`GET` through `/dev/tcp/proxy/8888`, `net` expiry/extend/stop/SIGKILL, allow-all, promotion,
   approval, drift/recreate, sockets, rm/ls/prune, clone, linked worktree, shared state volume, derived
   image on Alpine, host-path working directory, protected paths read-only and created empty on the
@@ -326,6 +355,12 @@ creation rolls back what it created on failure; at most one network session per 
   host RAM/swap, which is accepted over builds failing on a cap; `/var/tmp` remains on disk. Wiping
   `/tmp` at start instead was rejected: a workspace under `/tmp` is bind-mounted there and would be
   deleted.
+- **File-system watcher fixing ownership/ACLs as they drift**: rejected. Symmetric ACLs remove
+  the common cause (replaced files carrying a copied ACL). A watcher would be a host daemon that
+  has to run whenever the sandbox runs, needs inotify watches for the whole tree, races the agent's
+  own atomic writes, cannot change ACLs of files it does not own (so it would need root execs
+  anyway), and would be a host-user process acting on paths the agent controls. The rare
+  remaining drift (`chmod` by the agent) is left to `repair`.
 - **Protecting `.claude/` costs** Claude Code the ability to persist "always allow" answers in
   `settings.local.json` and the agent the ability to write project skills/commands directly; it
   drafts them elsewhere and the user promotes them. A project can drop entries from `protected`.
