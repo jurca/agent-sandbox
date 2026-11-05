@@ -221,6 +221,8 @@ SECURITY NOTES
 
 - The container is the boundary: default seccomp/AppArmor, no-new-privileges, no sudo, a
   non-root user. Only the workspace, harness state volumes and your extra mounts are shared.
+- Disable the harness's own sandbox (Claude Code's bubblewrap sandbox, VS Code's
+  chat.agent.sandbox): it cannot start inside the container, which already isolates more.
 - The proxy container runs as `nobody` with no capabilities and no host mounts; its
   configuration is copied in, so a compromised proxy owns nothing on the host.
 - `agent-sandbox root` is for setup. In a rootless engine root is your own host user on every
