@@ -257,7 +257,7 @@ with the list of changed keys and tells the user to run `recreate`.
   with counts and the user may append them to `allow.extra` (`y`, `N` or `s`elect each); the approval
   snapshot is updated.
 
-## 6. Environment setup (planned)
+## 6. Environment setup
 
 Projects need more than a base image: system packages, devcontainer Features, internal CA
 certificates, `~/.bashrc` changes, and per-workspace steps such as `uv sync`, `poetry sync` or
