@@ -429,8 +429,14 @@ wait "$pid"
 
 
 def proxy_dockerfile(base_image: str) -> str:
-    # A host AppArmor profile for tinyproxy (Ubuntu ships one) attaches by executable path and
-    # also confines containers, so the binary is copied to a path no profile knows.
+    # Ubuntu ships a host AppArmor profile for /usr/bin/tinyproxy. Under rootless engines the
+    # container runs without a profile of its own, so that host profile attaches to our binary
+    # by path. Moving our files to the paths it allows is not enough: it permits no signal
+    # receive, so the supervisor could neither reload (USR1) nor stop (TERM/KILL) tinyproxy,
+    # and tier switching and deadline expiry would break. It also adds nothing here: it allows
+    # any inet egress (the real risk of a compromised proxy), and its file and exec limits only
+    # guard a container holding public image files, already run as nobody with no capabilities.
+    # So the binary is copied to a path no profile knows.
     return (
         f"FROM {base_image}\n"
         "RUN apk add --no-cache tinyproxy \\\n"
