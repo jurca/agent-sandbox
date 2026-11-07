@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import approval, devcontainer, proxyctl
+from . import approval, devcontainer, proxyctl, secretfiles
 from .config import (
     DEFAULT_PROXY_BASE_IMAGE,
     DOCKERFILE,
@@ -562,6 +562,7 @@ def ensure_ready(ctx: Context, *, unsafe_sockets: bool = False) -> None:
     with project_lock(project):
         approval.ensure_approved(project)
         info = engine.inspect("container", project.workspace_container)
+        secretfiles.enforce(project.root, project.id, ctx.config, history=info is None)
         if info is None:
             create_sandbox(ctx, unsafe_sockets=unsafe_sockets)
             return
@@ -794,4 +795,5 @@ def remove_by_id(engine: Engine, sandbox_id: str, *, state: bool) -> list[str]:
     shutil.rmtree(runtime_dir() / sandbox_id, ignore_errors=True)
     if state:
         (state_dir() / "setup" / f"{sandbox_id}.json").unlink(missing_ok=True)
+        secretfiles.forget_rotated(sandbox_id)
     return removed

@@ -30,6 +30,12 @@ protected = [".claude", ".agents", ".vscode", ".idea", ".devcontainer"]
 # Replaced by a volume of this workspace: the sandbox builds its own copy (virtualenv,
 # node_modules) and never writes the one the host runs.
 isolated = [".venv", "node_modules"]
+# Secret files (.env, .env.*, *.env by default) may only be symlinks out of the workspace, ignored
+# by a committed .gitignore; `agent-sandbox secrets adopt` moves real ones. See `help security`.
+# secrets = ["*.secret"]             # more file names, on top of the defaults
+# secrets_except = [".env.test"]     # exact names holding no secrets, on top of .env.example,
+#                                    # .env.sample and .env.template
+# secrets_history_depth = 200        # also search this many newest commits when creating
 
 [state]
 # Directories below the container user's home that survive `rm` and `recreate`.

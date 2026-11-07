@@ -2,7 +2,7 @@
 
 Status: implemented and tested on rootless docker (see section 10); podman and rootful untested.
 Section 6 (environment setup, devcontainer base) is implemented and tested the same way.
-"Secret files" in section 8 is designed, not implemented yet.
+"Secret files" in section 8 is implemented and tested the same way.
 The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
 
 ## 1. Purpose and threat model
@@ -444,7 +444,7 @@ others become the default (or empty) with a warning; anything else is left as is
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
 | `secrets check` | run the secret file checks (section 8) without starting anything; exit 1 on a finding |
 | `secrets adopt [--dry-run]` | move real secret files to the secrets directory and leave symlinks; never edits `.gitignore` |
-| `secrets rotated PATH...` | with the history check enabled: record that the secrets once committed at these paths were rotated (section 8) |
+| `secrets rotated PATH...` | with the history check enabled: record that the secrets in the commits at these paths so far were rotated (section 8) |
 | `status` | state, approval, drift, proxy tier and time left |
 | `doctor` | live isolation checks (no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
 | `repair` | reclaim workspace files owned by the sandbox user's sub-uid, re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
@@ -506,10 +506,13 @@ with its fix, and warns that sessions already running can read a real file it fo
 7. **History, opt-in and at creation only**: off by default, because finding committed secrets is
    the job of the server-side scanner and the pre-commit hook, and a slow start gets a check switched
    off. `[workspace] secrets_history_depth = N` (a positive integer) searches the newest `N` commits
-   across all refs (`git log --all -n N`, names filtered afterwards: `-n` with a pathspec counts
-   only matching commits, so it would walk all of a clean history). `.git` is readable in the
-   sandbox, so a matching path refuses creation until the user runs `secrets rotated PATH...`,
-   recorded in the workspace state. Best effort: older commits and unreachable objects are not
+   across all refs (`git log --all -n N`, names filtered afterwards: with a pathspec or
+   `--diff-filter`, `-n` counts only matching commits, so it would walk all of a clean history).
+   `.git` is readable in the sandbox, so a commit adding or changing a matching path refuses
+   creation until the user runs `secrets rotated PATH...`. That records in the workspace state every
+   commit on any ref that adds or changes the path so far, rather than a point in time (refs need
+   not be linear, clocks drift): a later commit at the path is a new finding, and so is a rewritten
+   one, while removing the file is not. Best effort: older commits and unreachable objects are not
    searched.
 
 `secrets adopt` moves each real file to `<config dir>/secrets/<id>/<relative path>` (`0600`),
@@ -583,7 +586,8 @@ secrets already committed, unless the history check finds them: the agent can re
 - Secret files, integration: a dangling link in the container; refusal on a real file, a link
   outside `secrets/`, a tracked file and an excludes-only rule; `adopt` then a clean start; the
   check on `exec` against a running sandbox; the history check off by default, refusing a match
-  within `secrets_history_depth`, missing one beyond it, and passing after `secrets rotated`.
+  within `secrets_history_depth`, missing one beyond it, passing after `secrets rotated`, and
+  refusing again after a new commit at the path.
 - Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.

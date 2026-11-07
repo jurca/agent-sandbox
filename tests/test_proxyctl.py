@@ -41,7 +41,7 @@ def test_base_tier_is_pushed_filter_first(
     assert 'Filter "/var/lib/asb/base.filter"' in conf
     assert "Upstream http user:secret@corp:3128" in conf and 'Upstream none ".corp.example"' in conf
     assert pushed(engine, project, "net.conf").replace("net.filter", "base.filter") == conf
-    assert not any("secret" in p.read_text() for p in isolated_dirs.rglob("*") if p.is_file())
+    assert not any("user:secret" in p.read_text() for p in isolated_dirs.rglob("*") if p.is_file())
 
 
 def test_base_tier_does_not_clobber_running_session(project: Project) -> None:

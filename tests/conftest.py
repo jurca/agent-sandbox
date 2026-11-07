@@ -47,7 +47,8 @@ def make_repo(path: Path) -> Path:
     git(path, "config", "user.email", "test@example.invalid")
     git(path, "config", "user.name", "Test")
     (path / "README").write_text("hello\n")
-    git(path, "add", "README")
+    (path / ".gitignore").write_text(".env\n.env.*\n*.env\n")
+    git(path, "add", "README", ".gitignore")
     git(path, "commit", "-q", "-m", "initial")
     return path.resolve()
 

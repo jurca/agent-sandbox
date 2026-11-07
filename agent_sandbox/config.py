@@ -25,6 +25,8 @@ DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
 DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
 DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea", ".devcontainer")
 DEFAULT_ISOLATED = (".venv", "node_modules")
+DEFAULT_SECRETS = (".env", ".env.*", "*.env")
+DEFAULT_SECRETS_EXCEPT = (".env.example", ".env.sample", ".env.template")
 DEFAULT_PROXY_BASE_IMAGE = "alpine:3"
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
@@ -56,6 +58,9 @@ class ProjectConfig:
     state_paths: list[str] = field(default_factory=lambda: list(DEFAULT_STATE_PATHS))
     protected: list[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED))
     isolated: list[str] = field(default_factory=lambda: list(DEFAULT_ISOLATED))
+    secrets: list[str] = field(default_factory=lambda: list(DEFAULT_SECRETS))
+    secrets_except: list[str] = field(default_factory=lambda: list(DEFAULT_SECRETS_EXCEPT))
+    secrets_history_depth: int | None = None
     proxy_base_image: str | None = None
     setup_create: list[str] = field(default_factory=list)
     setup_start: list[str] = field(default_factory=list)
@@ -99,6 +104,36 @@ def _string_list(value: Any, where: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise SandboxError(f"{where} must be a list of strings.")
     return list(value)
+
+
+def _secret_settings(
+    workspace: dict[str, Any], where: str
+) -> tuple[list[str], list[str], int | None]:
+    """A project adds to the defaults. It can exempt a name, but not switch the rules off."""
+    patterns = list(DEFAULT_SECRETS)
+    for pattern in _string_list(workspace.get("secrets", []), f"{where} [workspace] secrets"):
+        if "/" in pattern or "[" in pattern or not pattern.strip("*?"):
+            raise SandboxError(
+                f"{where}: [workspace] secrets {pattern!r} must be a file name in which only `*` "
+                "and `?` are special, and must not match every name."
+            )
+        if pattern not in patterns:
+            patterns.append(pattern)
+    exempt = list(DEFAULT_SECRETS_EXCEPT)
+    where_except = f"{where} [workspace] secrets_except"
+    for name in _string_list(workspace.get("secrets_except", []), where_except):
+        if not name or any(char in name for char in "*?[/"):
+            raise SandboxError(f"{where_except}: {name!r} must be one exact file name.")
+        if name in patterns:
+            raise SandboxError(f"{where_except}: {name!r} cannot be exempted.")
+        if name not in exempt:
+            exempt.append(name)
+    depth = workspace.get("secrets_history_depth")
+    if depth is not None and (not isinstance(depth, int) or isinstance(depth, bool) or depth < 1):
+        raise SandboxError(
+            f"{where}: [workspace] secrets_history_depth must be a positive integer."
+        )
+    return patterns, exempt, depth
 
 
 def _workspace_paths(value: Any, where: str) -> list[str]:
@@ -240,7 +275,12 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         mounts.append(MountSpec(source.rstrip("/") or "/", target.rstrip("/") or "/"))
 
     workspace = _table(data, "workspace", where)
-    _only(workspace, {"protected", "isolated"}, f"{where} [workspace]")
+    _only(
+        workspace,
+        {"protected", "isolated", "secrets", "secrets_except", "secrets_history_depth"},
+        f"{where} [workspace]",
+    )
+    secrets, secrets_except, secrets_history_depth = _secret_settings(workspace, where)
     protected = (
         _workspace_paths(workspace["protected"], f"{where} [workspace] protected")
         if "protected" in workspace
@@ -298,6 +338,9 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
         state_paths=state_paths,
         protected=protected,
         isolated=isolated,
+        secrets=secrets,
+        secrets_except=secrets_except,
+        secrets_history_depth=secrets_history_depth,
         proxy_base_image=base,
         setup_create=setup_create,
         setup_start=setup_start,

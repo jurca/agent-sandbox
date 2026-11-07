@@ -957,3 +957,78 @@ def test_devcontainer_flow(env: Env, scratch: Path) -> None:
         asb(env, scratch, "rm", "--state")
         for layer in ("devcontainer", "user"):
             remove_images(f"localhost/agent-sandbox/{USER}-{make_id(scratch)}-{layer}:")
+
+
+# --- secret files -----------------------------------------------------------------------
+
+
+def test_secret_files_stay_out_of_the_sandbox(env: Env, scratch: Path) -> None:
+    secret = scratch / ".env"
+    secret.write_text("FAKE_CANARY=1\n")
+    refused = asb(env, scratch, "exec", "--", "true")
+    assert refused.code != 0 and "a real file in the workspace" in refused.text
+    assert "FAKE_CANARY" not in refused.text
+    assert engine("container", "inspect", f"agent-sandbox-{make_id(scratch)}").returncode != 0
+    assert asb(env, scratch, "secrets", "check").code == 1
+
+    assert ok(env, scratch, "secrets", "adopt").code == 0
+    assert secret.is_symlink() and secret.read_text() == "FAKE_CANARY=1\n"
+    assert str(secret.resolve()).startswith(str(env.base / "config" / "secrets"))
+
+    # A dangling link inside, and nothing to find anywhere the sandbox can read.
+    assert sh(env, scratch, "test -L .env && ! test -e .env && echo ok").strip() == "ok"
+    assert sh(env, scratch, "grep -rl FAKE_CANARY . ~ 2>/dev/null; true").strip() == ""
+
+    # A real file that appears later stops every further start.
+    secret.unlink()
+    secret.write_text("FAKE_CANARY=2\n")
+    refused = asb(env, scratch, "exec", "--", "true")
+    assert refused.code != 0 and "sessions can read" in refused.text
+    secret.unlink()
+    secret.symlink_to(env.base / "elsewhere")
+    assert "outside" in asb(env, scratch, "exec", "--", "true").text
+    secret.unlink()
+    assert ok(env, scratch, "exec", "--", "true").code == 0
+
+
+def test_secret_rules_block_creation(env: Env, scratch: Path) -> None:
+    (scratch / ".gitignore").write_text("")
+    git(scratch, "add", ".gitignore")
+    git(scratch, "commit", "-q", "-m", "no rules")
+    assert "rule for .env" in asb(env, scratch, "exec", "--", "true").text
+    (scratch / ".git" / "info" / "exclude").write_text(".env\n.env.*\n*.env\n")
+    assert "which clones do not get" in asb(env, scratch, "exec", "--", "true").text
+    (scratch / ".git" / "info" / "exclude").write_text("")
+    (scratch / ".gitignore").write_text(".env\n.env.*\n*.env\n")
+    git(scratch, "add", ".gitignore")
+    git(scratch, "commit", "-q", "-m", "rules")
+    tracked = scratch / "tracked.env"
+    tracked.write_text("FAKE=1\n")
+    git(scratch, "add", "-f", "tracked.env")
+    git(scratch, "commit", "-q", "-m", "oops")
+    assert "tracked by git" in asb(env, scratch, "exec", "--", "true").text
+    git(scratch, "rm", "-q", "--cached", "tracked.env")
+    git(scratch, "commit", "-q", "-m", "remove")
+    tracked.unlink()
+    assert ok(env, scratch, "exec", "--", "true").code == 0  # the history check is off
+
+
+def test_secret_history_check_is_opt_in_and_bounded(env: Env, scratch: Path) -> None:
+    tracked = scratch / "old.env"
+    tracked.write_text("FAKE=1\n")
+    git(scratch, "add", "-f", "old.env")
+    git(scratch, "commit", "-q", "-m", "oops")
+    git(scratch, "rm", "-q", "--cached", "old.env")
+    git(scratch, "commit", "-q", "-m", "remove")
+    tracked.unlink()
+    git(scratch, "commit", "-q", "--allow-empty", "-m", "newer")
+    config = scratch / ".agent-sandbox" / "config.toml"
+    text = config.read_text()
+    config.write_text(text.replace("[workspace]\n", "[workspace]\nsecrets_history_depth = 1\n", 1))
+    approve(env, scratch)  # beyond the depth: not found, and this creates the sandbox
+    ok(env, scratch, "rm")
+    config.write_text(text.replace("[workspace]\n", "[workspace]\nsecrets_history_depth = 3\n", 1))
+    run = PtyRun(env, scratch, ("exec", "--", "true"), answer((r"Approve this", "y"))).start()
+    assert run.wait().code != 0 and "secrets rotated old.env" in run.output
+    ok(env, scratch, "secrets", "rotated", "old.env")
+    assert ok(env, scratch, "exec", "--", "true").code == 0

@@ -90,19 +90,21 @@ def project_for(root: Path) -> Project:
     return Project(root=root, id=make_id(root))
 
 
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def host_git(cwd: Path, *args: str, input: str | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     return subprocess.run(
         ["git", "-c", "core.fsmonitor=false", "-C", str(cwd), *args],
         capture_output=True,
         text=True,
+        errors="surrogateescape",  # file names need not be valid UTF-8
+        input=input,
         env=env,
         check=False,
     )
 
 
 def git_toplevel(cwd: Path) -> Path | None:
-    result = _git(cwd, "rev-parse", "--show-toplevel")
+    result = host_git(cwd, "rev-parse", "--show-toplevel")
     if result.returncode != 0:
         return None
     return Path(result.stdout.strip()).resolve()
@@ -136,7 +138,7 @@ def git_layout(root: Path) -> GitLayout:
         args = ["rev-parse", flag]
         if flag == "--git-common-dir":
             args.insert(1, "--path-format=absolute")
-        result = _git(root, *args)
+        result = host_git(root, *args)
         if result.returncode != 0:
             raise SandboxError(f"git could not resolve {flag} for {root}: {result.stderr.strip()}")
         path = Path(result.stdout.strip()).resolve()

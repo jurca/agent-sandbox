@@ -7,8 +7,8 @@ import os
 import sys
 from pathlib import Path
 
-from . import approval, manage, setup
-from .config import CONFIG_FILE, PROJECT_DIR, load_user_config
+from . import approval, manage, secretfiles, setup
+from .config import CONFIG_FILE, PROJECT_DIR, load_project_config, load_user_config
 from .engine import Engine, detect_engine
 from .images import ensure_proxy_image
 from .net import run_net, stop_net
@@ -27,7 +27,7 @@ from .util import SandboxError, eprint, parse_duration
 UNSAFE_FLAG = "--unsafely-mount-dirs-with-sockets"
 COMMANDS = (
     "init", "exec", "root", "net", "setup", "stop", "rm", "recreate", "rebuild", "ls", "prune",
-    "status", "doctor", "repair",
+    "status", "doctor", "repair", "secrets",
 )  # fmt: skip
 
 OVERVIEW = f"""\
@@ -66,6 +66,9 @@ COMMANDS
   status                            Show state, approval and configuration drift.
   doctor                            Check isolation of a running sandbox.
   repair                            Reclaim sandbox-owned files, re-apply access.
+  secrets check                     Run the secret file checks (see `help security`).
+  secrets adopt [--dry-run]         Move real secret files out of the workspace, leave symlinks.
+  secrets rotated PATH...           Record that a secret once committed at PATH was rotated.
   help [config|setup|network|security|COMMAND]
 
 OPTIONS
@@ -109,6 +112,14 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
   [workspace] isolated
                    workspace paths replaced by a per-workspace volume, so the sandbox keeps
                    its own copy (default: .venv node_modules)
+  [workspace] secrets
+                   file names that may only be symlinks out of the workspace, on top of the
+                   defaults .env .env.* *.env (see `help security`)
+  [workspace] secrets_except
+                   exact names holding no secrets, on top of the defaults .env.example
+                   .env.sample .env.template
+  [workspace] secrets_history_depth
+                   also search this many newest commits when creating the sandbox (default: off)
   [[mounts]]       extra read-only bind mounts: source, target (default: source); `~` is
                    your home in source and the container home in target
   [state] paths    directories under the container home kept in a volume
@@ -235,6 +246,13 @@ SECURITY NOTES
 - The sandbox cannot protect you from code you run yourself. Tests run on the host by
   pre-commit, build scripts, CI jobs (with their tokens and deploy keys): anything the agent wrote
   runs with full rights there and could exfiltrate secrets. Review before running.
+- Secret files (.env, .env.*, *.env) never enter the workspace. Each must be a symlink into
+  ~/.config/agent-sandbox/secrets/ (it dangles in the sandbox) and ignored by a committed
+  .gitignore; `secrets adopt` moves real files there. Anything else stops the sandbox from
+  starting. These checks run when something starts: a real file that appears during a session
+  (for example from `sed -i` on the link, which replaces it with a copy) is readable until the
+  next check. They go by name, and secrets already committed stay readable through .git
+  (`secrets_history_depth` searches recent commits). Leave those to your secrets scanner.
 - Network access is closed by default because agents, like people, can be manipulated (prompt
   injection). The design limits what a manipulated agent can reach instead of trusting it.
 - Rootless docker maps the container user to a sub-uid, so the workspace is shared with ACLs
@@ -292,6 +310,13 @@ def build_parser() -> argparse.ArgumentParser:
     add("status", "Show the state of this sandbox.")
     add("doctor", "Check the isolation of the running sandbox.")
     add("repair", "Reclaim sandbox-owned files, re-apply file access and ownership.")
+    p = add("secrets", "Check and move secret files (see `help security`).")
+    actions = p.add_subparsers(dest="action", required=True)
+    actions.add_parser("check", help="run the checks without starting anything")
+    q = actions.add_parser("adopt", help="move real secret files out, leave symlinks")
+    q.add_argument("--dry-run", action="store_true", help="only show what would be moved")
+    q = actions.add_parser("rotated", help="record that a once committed secret was rotated")
+    q.add_argument("paths", nargs="+", metavar="PATH", help="path relative to the workspace root")
     return parser
 
 
@@ -394,6 +419,31 @@ def _cmd_rebuild(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_secrets(args: argparse.Namespace) -> int:
+    project = find_project(Path.cwd())
+    with project_lock(project):
+        approval.ensure_approved(project)  # its patterns decide what moves and what passes
+        config = load_project_config(project.root)
+        if args.action == "rotated":
+            secretfiles.record_rotated(project.root, project.id, args.paths, config)
+            print("Recorded.")
+            return 0
+        if args.action == "adopt":
+            for item in secretfiles.adopt(project.root, project.id, config, dry_run=args.dry_run):
+                if item.target is None:
+                    print(f"{item.relative}: not moved: {item.refused}")
+                else:
+                    print(f"{item.relative} -> {item.target}")
+            if args.dry_run:
+                return 0
+        findings = secretfiles.check(project.root, project.id, config, history=True)
+    if findings:
+        print(secretfiles.report(findings))
+        return 1
+    print("Secret file checks passed.")
+    return 0
+
+
 def _dispatch(argv: list[str]) -> int:
     if argv and argv[0] in ("-h", "--help"):
         print(OVERVIEW)
@@ -457,6 +507,8 @@ def _dispatch(argv: list[str]) -> int:
         return _cmd_recreate(args)
     if cmd == "rebuild":
         return _cmd_rebuild(args)
+    if cmd == "secrets":
+        return _cmd_secrets(args)
     if cmd == "ls":
         manage.print_workspaces(manage.list_workspaces())
         return 0
