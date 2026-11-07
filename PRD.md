@@ -2,6 +2,7 @@
 
 Status: implemented and tested on rootless docker (see section 10); podman and rootful untested.
 Section 6 (environment setup, devcontainer base) is implemented and tested the same way.
+"Secret files" in section 8 is designed, not implemented yet.
 The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
 
 ## 1. Purpose and threat model
@@ -30,6 +31,11 @@ Key properties:
   anything the user or the CI runner can, including exfiltrating secrets. The sandbox only makes
   sure the agent's code runs *outside* it after a human chose to run it, never on its own. Review
   agent changes before running them where secrets live.
+- **Secret files never enter the workspace.** The policy makes `.env`-style files unreadable to any
+  AI agent, and a bind mount shares every file the host creates later. So real secrets live outside
+  the workspace, reached through a symlink that dangles in the container, and nothing starts in the
+  sandbox while a real one is found (section 8, "Secret files"). This covers files by name only,
+  and it does not cover agent-written code a person runs on the host (see above).
 - That is also why network access is closed by default. People are manipulated against their own
   interests every day; it would be unfair to expect an LLM agent to withstand every prompt
   injection. So the design does not rely on the agent resisting manipulation. It limits where the
@@ -38,7 +44,7 @@ Key properties:
   the user opened.
 - The container sits on an **internal network** (no route out). Its only way out is a tinyproxy
   container with an allowlist. Blocking the internal network (10.0.0.0/8) by default is required
-  by company security policy.
+  by security policy.
 - Rootless engines are preferred; rootful is supported with an explicit opt-in.
 
 Non-goals: protection against kernel/container-runtime escapes (use a VM for that); managing VS
@@ -159,7 +165,8 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 - `config.toml`: `image` or `[devcontainer] enabled`/`config` (exactly one, section 6), `harness`
   (default `bash`), `[env] pass`/`[env.set]`,
   `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`, `.devcontainer`),
-  `[workspace] isolated` (default `.venv`, `node_modules`), `[[mounts]]` (`source`, `target`
+  `[workspace] isolated` (default `.venv`, `node_modules`), `[workspace] secrets`,
+  `secrets_except` and `secrets_history_depth` (section 8, "Secret files"), `[[mounts]]` (`source`, `target`
   defaulting to `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
   `.cache/pre-commit`), `[proxy] base_image`, `[setup] create`/`start`. Unknown keys are errors.
 - Workspace paths (`protected`, `isolated`) are relative to the workspace root and normalised
@@ -435,6 +442,9 @@ others become the default (or empty) with a warning; anything else is left as is
 | `setup` | rerun the setup create and start phases in the running container (section 6) |
 | `ls` | all sandboxes on all engines, orphans flagged |
 | `prune [--keep-state]` | remove orphaned sandboxes (workspace gone, not a git tree, id mismatch), y/N each |
+| `secrets check` | run the secret file checks (section 8) without starting anything; exit 1 on a finding |
+| `secrets adopt [--dry-run]` | move real secret files to the secrets directory and leave symlinks; never edits `.gitignore` |
+| `secrets rotated PATH...` | with the history check enabled: record that the secrets once committed at these paths were rotated (section 8) |
 | `status` | state, approval, drift, proxy tier and time left |
 | `doctor` | live isolation checks (no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
 | `repair` | reclaim workspace files owned by the sandbox user's sub-uid, re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
@@ -458,6 +468,72 @@ creation rolls back what it created on failure; at most one network session per 
   `--unsafely-mount-dirs-with-sockets` is given, in which case a warning is printed and the user must
   type `I understand the risks`.
 - SELinux + podman: `relabel=shared` on the workspace mount.
+
+### Secret files
+
+Files whose **basename** matches `[workspace] secrets` are secret files. The project list adds to
+the defaults `.env`, `.env.*` and `*.env`, and cannot remove them. `[workspace] secrets_except`
+adds exact basenames holding no secrets to the defaults `.env.example`, `.env.sample` and
+`.env.template`, exempting them from every rule here; frameworks that commit `.env.test` or
+`.env.development` list those. A wildcard, or a default name such as `.env`, is an error. Both live in
+the approved project config, so the agent cannot change them. Directories never match (`.env/` is
+a common virtualenv name).
+
+**Run on the host before anything starts in the sandbox** (no command, `exec`, `root`, `setup`, and
+before creation), under the per-project lock. Any finding refuses to start, lists every finding
+with its fix, and warns that sessions already running can read a real file it found.
+
+1. **Scan** the workspace without following symlinks, skipping every `.git` and isolated paths (the
+   container sees the volume there, not the host tree), and also every extra mount source. There is
+   no budget and a notice is not enough: a directory the host cannot read is a finding.
+2. **Real files**: a match that is not a symlink is a finding, whatever its mode.
+3. **Symlink targets**: a matching symlink must resolve inside `<config dir>/secrets/`, created
+   `0700`. The target may be missing. Extra mounts already refuse the config directory, so the
+   target can never be in the container. The fixed location also stops the agent, which can replace
+   links in the workspace, from pointing one at `~/.ssh/id_rsa` or at a file it wrote, for host tools
+   to read. A workspace containing the secrets directory (a repository at `~`) is refused.
+4. **Ignored and untracked**: every match in the workspace must pass `git check-ignore -q` (without
+   `--no-index`, so a tracked file fails even when listed in `.gitignore`; a directory-only pattern
+   such as `.env/` fails for a symlink, as it should).
+5. **Rule that protects clones**: the rule must come from a `.gitignore` tracked by git, read
+   from `git check-ignore -v -n`. `.git/info/exclude` and a global excludes file protect one machine
+   only, and in `git = "rw"` mode the agent can write `.git/`. Decide from the reported pattern:
+   with `-v` the exit code is 0 for a negated rule too.
+6. **Files that do not exist yet**: for each pattern outside `secrets_except`, `*` is replaced by a
+   probe name and that name is checked at the root and one directory down
+   (`.env`, `agent-sandbox-probe/.env`). Waiting for the file to appear would be too late: the
+   point is that the first `git add` of a new `.env` already does nothing.
+7. **History, opt-in and at creation only**: off by default, because finding committed secrets is
+   the job of the server-side scanner and the pre-commit hook, and a slow start gets a check switched
+   off. `[workspace] secrets_history_depth = N` (a positive integer) searches the newest `N` commits
+   across all refs (`git log --all -n N`, names filtered afterwards: `-n` with a pathspec counts
+   only matching commits, so it would walk all of a clean history). `.git` is readable in the
+   sandbox, so a matching path refuses creation until the user runs `secrets rotated PATH...`,
+   recorded in the workspace state. Best effort: older commits and unreachable objects are not
+   searched.
+
+`secrets adopt` moves each real file to `<config dir>/secrets/<id>/<relative path>` (`0600`),
+copies it to a new file so no ACL comes along, and atomically replaces the original with an
+absolute symlink. A linked worktree can link to the same file by hand, as anything under `secrets/`
+passes. It refuses a tracked file: that is already in history, so it prints the steps instead
+(`git rm --cached`, rotate, and `secrets rotated` if the history check is enabled).
+
+Inside the sandbox a secret file is a dangling link (`ENOENT`). Code that needs values gets dummy
+ones from `[env.set]` or an excepted file such as `.env.test`, and a tool that insists on `.env`
+fails there. A write through the link lands in the container's own disk at most, never on the host.
+
+A dev container may mount the secrets, because the sandbox does not apply `mounts` from
+`devcontainer.json`. The links are absolute, so the target must equal the host path, for example
+`source=${localEnv:HOME}/.config/agent-sandbox/secrets,target=${localEnv:HOME}/.config/agent-sandbox/secrets,type=bind,readonly`.
+An agent started inside that dev container can read them: it is not a sandbox.
+
+**Known gap, accepted:** the checks run when something starts. A real file that appears during a
+session is readable until the next check, and that includes a host `sed -i` without
+`--follow-symlinks`, which replaces the link with a copy of the secret. So does any tool that
+replaces rather than writes through the link. Secrets the agent is told or sees in other files
+(`.env.bak`, logs, build output) are out of scope too; those belong to the secrets scanner. So are
+secrets already committed, unless the history check finds them: the agent can read those through
+`.git`.
 
 ## 9. Harness facts used for defaults
 
@@ -504,6 +580,10 @@ creation rolls back what it created on failure; at most one network session per 
   created; and, when `ASB_TEST_DEVCONTAINER_CLI` is set, the devcontainer flow (missing lockfile,
   `upgrade`, build with a local Feature, lifecycle commands, `remoteEnv`, read-only
   `.devcontainer/`).
+- Secret files, integration: a dangling link in the container; refusal on a real file, a link
+  outside `secrets/`, a tracked file and an excludes-only rule; `adopt` then a clean start; the
+  check on `exec` against a running sandbox; the history check off by default, refusing a match
+  within `secrets_history_depth`, missing one beyond it, and passing after `secrets rotated`.
 - Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
@@ -564,6 +644,19 @@ creation rolls back what it created on failure; at most one network session per 
   dependency hooks the agent may have planted.
 - **Proxying image builds**: not done. Builds run approved inputs only, and BuildKit cannot attach
   `RUN` steps to the internal network.
+- **`chmod 600` on secret files**: rejected. `apply_acls` names the sandbox user on every file, and
+  the default ACLs override `umask` for new ones (verified: `umask 077` on the host still gave a
+  file the sandbox could read). Under keep-id and rootful engines the sandbox user is the owner
+  anyway.
+- **Masking secret files with an empty read-only bind mount**: rejected, also as a backup for the
+  symlinks. It does stop the agent (write, `rm`, `mv`, `ln`, `umount`, `unshare` and `/proc/1/root`
+  all failed), but on rootless docker: a host tmp+rename or `rm` + recreate silently removes the mask
+  (a rename away moves it with the old name), new files are never masked, and on a symlink the
+  engine follows the link and mounts over the target path, leaving `.env` unprotected when the link
+  is replaced. With real files refused at every start, a mask would have nothing left to cover.
+- **Per-pattern FUSE filter over the workspace**: rejected. It is the only option that closes the
+  mid-session gap, but needs a third-party dependency and a daemon, slows every workspace access and
+  conflicts with the standard-library-only rule.
 
 ## 12. Deferred / out of scope for v1
 
@@ -572,4 +665,6 @@ OpenCode defaults; replacing the user's separate
 Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
 user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
 project config); resolving symlinks inside mounted skill directories (links pointing outside the
-mount dangle in the container).
+mount dangle in the container); a host-side watcher stopping the container when a real secret file
+appears mid-session (needs a process that outlives `exec`, which today replaces the launcher, and
+still leaves a short window); a user-level secrets directory other than `<config dir>/secrets/`.
