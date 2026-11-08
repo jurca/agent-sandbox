@@ -654,9 +654,22 @@ def remote_env(ctx: Context, current: Session) -> dict[str, str]:
     }
 
 
-def exec_env(ctx: Context, home: str, extra: dict[str, str] | None = None) -> list[str]:
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def user_path(path: str, home: str) -> str:
+    """`path` with the user's `~/.local/bin` in front (where the profile would put it)."""
+    entry = f"{home}/.local/bin"
+    parts = [p for p in path.split(":") if p]
+    return path if entry in parts else ":".join([entry, *parts])
+
+
+def exec_env(
+    ctx: Context, home: str, extra: dict[str, str] | None = None, *, path: str | None = None
+) -> list[str]:
     """Environment arguments; `extra` (remoteEnv) never overrides the toolkit's own variables
-    or the configured ones."""
+    or the configured ones. With `path` (the container's PATH), `PATH` gets `~/.local/bin` in
+    front, of remoteEnv's PATH if it has one; a configured PATH is left alone."""
     values: dict[str, str] = {
         "HTTP_PROXY": PROXY_URL,
         "HTTPS_PROXY": PROXY_URL,
@@ -670,10 +683,12 @@ def exec_env(ctx: Context, home: str, extra: dict[str, str] | None = None) -> li
         "GIT_OPTIONAL_LOCKS": "0",
         "AGENT_SANDBOX": "1",
     }
+    configured = set(ctx.config.env_set) | {n for n in ctx.config.env_pass if n in os.environ}
+    if path is not None and "PATH" not in configured:
+        values["PATH"] = user_path((extra or {}).get("PATH") or path or DEFAULT_PATH, home)
     args: list[str] = []
     for key, value in values.items():
         args += ["-e", f"{key}={value}"]
-    configured = set(ctx.config.env_set) | {n for n in ctx.config.env_pass if n in os.environ}
     for key, value in (extra or {}).items():
         if key not in values and key not in configured:
             args += ["-e", f"{key}={value}"]
@@ -704,7 +719,7 @@ ROOT_NOTE_ROOTFUL = (
 )
 
 
-def _resolve_command(ctx: Context, command: list[str] | None, home: str) -> list[str]:
+def _resolve_command(ctx: Context, command: list[str] | None, env: list[str]) -> list[str]:
     if command:
         return command
     harness = ctx.config.harness
@@ -717,7 +732,7 @@ def _resolve_command(ctx: Context, command: list[str] | None, home: str) -> list
     if not words:
         return SHELL_FALLBACK
     probe = ctx.engine.run(
-        "exec", "--user", f"{ctx.uid}:{ctx.gid}", ctx.project.workspace_container,
+        "exec", "--user", f"{ctx.uid}:{ctx.gid}", *env, ctx.project.workspace_container,
         "sh", "-c", 'command -v "$1" >/dev/null 2>&1', "sh", words[0],
         check=False,
     )  # fmt: skip
@@ -739,8 +754,8 @@ def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bo
     args = ["exec", "-i"] + (["-t"] if tty else [])
     args += ["--user", "0" if root else f"{ctx.uid}:{ctx.gid}"]
     args += ["--workdir", str(ctx.project.root)]
-    args += exec_env(ctx, home, None if root else remote_env(ctx, current))
     if root:
+        args += exec_env(ctx, home)
         note = ROOT_NOTE_ROOTLESS if ctx.engine.rootless else ROOT_NOTE_ROOTFUL
         args += [
             "-e", f"AGENT_SANDBOX_BANNER={ROOT_BANNER.format(mode_note=note)}",
@@ -750,7 +765,9 @@ def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bo
         argv = ["sh", "-c", 'printf "%s" "$AGENT_SANDBOX_BANNER" >&2; exec "$@"', "sh"]
         argv += command or SHELL_FALLBACK
     else:
-        argv = command_with_umask(_resolve_command(ctx, command, home), ctx.umask)
+        env = exec_env(ctx, home, remote_env(ctx, current), path=current.image_env.get("PATH", ""))
+        args += env
+        argv = command_with_umask(_resolve_command(ctx, command, env), ctx.umask)
     ctx.engine.exec_replace([*args, ctx.project.workspace_container, *argv])
 
 

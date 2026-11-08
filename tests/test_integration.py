@@ -464,6 +464,27 @@ def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
     assert result.out.strip() == "0"
 
 
+def test_harness_in_local_bin_is_found(env: Env, workspace: Path) -> None:
+    sh(
+        env,
+        workspace,
+        'mkdir -p ~/.local/bin && printf "#!/bin/sh\\necho local-harness\\n" > ~/.local/bin/lh'
+        " && chmod +x ~/.local/bin/lh",
+    )
+    config = workspace / ".agent-sandbox" / "config.toml"
+    original = config.read_text()
+    config.write_text(original.replace('harness = "bash"', 'harness = "lh"'))
+    try:
+        approve(env, workspace)
+        result = ok(env, workspace)
+        assert "was not found" not in result.err
+        assert "local-harness" in result.out
+    finally:
+        config.write_text(original)
+        approve(env, workspace)
+        sh(env, workspace, "rm -f ~/.local/bin/lh")
+
+
 # --- network tiers ----------------------------------------------------------------------
 
 

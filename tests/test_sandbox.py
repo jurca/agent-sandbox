@@ -188,20 +188,42 @@ def test_exec_env(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert not any("corp" in p for p in pairs)
 
 
+def test_exec_env_puts_local_bin_on_the_path(configured: Path) -> None:
+    def path_of(args: list[str]) -> list[str]:
+        return [args[i + 1] for i in range(0, len(args), 2) if args[i + 1].startswith("PATH=")]
+
+    ctx = make_ctx(configured)
+    assert path_of(sandbox.exec_env(ctx, "/home/dev")) == []  # root execs: left alone
+    assert path_of(sandbox.exec_env(ctx, "/home/dev", path="/opt/go/bin:/usr/bin")) == [
+        "PATH=/home/dev/.local/bin:/opt/go/bin:/usr/bin"
+    ]
+    assert path_of(sandbox.exec_env(ctx, "/home/dev", path="")) == [
+        f"PATH=/home/dev/.local/bin:{sandbox.DEFAULT_PATH}"
+    ]
+    already = "/usr/bin:/home/dev/.local/bin"
+    assert path_of(sandbox.exec_env(ctx, "/home/dev", path=already)) == [f"PATH={already}"]
+    remote = {"PATH": "/usr/bin:/opt"}
+    assert path_of(sandbox.exec_env(ctx, "/home/dev", remote, path="/usr/bin")) == [
+        "PATH=/home/dev/.local/bin:/usr/bin:/opt"
+    ]
+    ctx.config.env_set["PATH"] = "/mine"
+    assert path_of(sandbox.exec_env(ctx, "/home/dev", remote, path="/usr/bin")) == ["PATH=/mine"]
+
+
 def test_resolve_command(configured: Path) -> None:
     engine = FakeEngine()
     found = {"claude"}
     engine.on(("exec",), lambda args: 0 if args[-1] in found else 1)
     ctx = make_ctx(configured, engine, config=ProjectConfig(image=IMAGE, harness="claude -c"))
-    assert sandbox._resolve_command(ctx, None, "/h") == ["claude", "-c"]
-    assert sandbox._resolve_command(ctx, ["tmux"], "/h") == ["tmux"]
+    assert sandbox._resolve_command(ctx, None, []) == ["claude", "-c"]
+    assert sandbox._resolve_command(ctx, ["tmux"], []) == ["tmux"]
     ctx.config.harness = "copilot"
-    assert sandbox._resolve_command(ctx, None, "/h") == sandbox.SHELL_FALLBACK
+    assert sandbox._resolve_command(ctx, None, []) == sandbox.SHELL_FALLBACK
     ctx.config.harness = "bash"
-    assert sandbox._resolve_command(ctx, None, "/h") == sandbox.SHELL_FALLBACK
+    assert sandbox._resolve_command(ctx, None, []) == sandbox.SHELL_FALLBACK
     ctx.config.harness = "'unterminated"
     with pytest.raises(SandboxError, match="Cannot parse"):
-        sandbox._resolve_command(ctx, None, "/h")
+        sandbox._resolve_command(ctx, None, [])
 
 
 def test_check_sockets(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:

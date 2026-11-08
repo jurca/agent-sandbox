@@ -169,7 +169,9 @@ def run_step(ctx: Context, step: Step, env_args: list[str]) -> bool:
 def run_steps(ctx: Context, steps: list[Step], current: Session) -> bool:
     """Run in order, stopping at the first failure."""
     subst = substitution(ctx, current)
-    env_args = exec_env(ctx, current.home, remote_env(ctx, current))
+    env_args = exec_env(
+        ctx, current.home, remote_env(ctx, current), path=current.image_env.get("PATH", "")
+    )
     for step in steps:
         command = step.command if step.origin == CONFIG_ORIGIN else subst.command(step.command)
         if not run_step(ctx, Step(step.origin, step.hook, command), env_args):

@@ -111,6 +111,10 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 - Environment at exec time (so changes need no recreate): proxy variables pointing at
   `http://proxy:8888`, git `safe.directory=*`, `GIT_OPTIONAL_LOCKS=0`, `AGENT_SANDBOX=1`, the
   configured `[env] pass` names (only if set on the host) and `[env.set]` values (`{home}` expands).
+  For the sandbox user (not `root`), `PATH` gets `~/.local/bin` in front of the container's (or
+  `remoteEnv`'s) `PATH`, unless `[env]` sets `PATH`. Execs do not start login shells: `/etc/profile`
+  resets `PATH` on Debian and Alpine, dropping the image's `ENV PATH`, and `~/.profile` would never
+  reach the harness anyway.
 - Default command: `harness` from config (shlex-split). If it is not installed: print an error and
   start `bash` (or `sh`). `exec -- CMD` runs arbitrary commands (a second harness, tmux).
 - `root`: `exec --user 0` with a prominent banner (setup only; do not run harnesses; root in a
