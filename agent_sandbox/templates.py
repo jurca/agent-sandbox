@@ -44,8 +44,8 @@ paths = [".claude", ".copilot", ".cache/pre-commit"]
 # Extra read-only bind mounts. The source must exist and must not contain unix sockets.
 # `~` in source is your home directory; `~` in target is the container user's home.
 # [[mounts]]
-# source = "/ceph"
-# target = "/ceph"
+# source = "~/.config/pypoetry"
+# target = "~/.config/pypoetry"
 # [[mounts]]
 # source = "~/.agents/skills"
 
