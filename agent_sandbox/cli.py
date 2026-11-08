@@ -187,9 +187,10 @@ Devcontainer (opt-in: [devcontainer] enabled = true instead of `image`)
   and commit it; when it is outdated, compare with `--dry-run` first. The configuration must be
   in .devcontainer/ (protected, approved as a whole); a .devcontainer.json in the workspace
   root, a Dockerfile or a local Feature outside .devcontainer/ are refused.
-  Applied: containerEnv (image), remoteEnv (exec environment; [env] wins), remoteUser, the
-  lifecycle commands. Not applied, with a warning: initializeCommand, runArgs, workspaceMount,
-  appPort, privileged, capAdd, securityOpt, mounts and Feature entrypoints (so for example
+  Applied: containerEnv (image), remoteEnv (exec environment; [env] wins), userEnvProbe (what
+  the user's shell rc files set up reaches every exec), remoteUser, the lifecycle commands.
+  Not applied, with a warning: initializeCommand, runArgs, workspaceMount, appPort,
+  privileged, capAdd, securityOpt, mounts and Feature entrypoints (so for example
   docker-in-docker installs but cannot run). Docker Compose configurations are refused.
   ${{localEnv:NAME}} only reads variables listed in [env] pass.
 """

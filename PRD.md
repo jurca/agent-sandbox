@@ -115,6 +115,18 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
   `remoteEnv`'s) `PATH`, unless `[env]` sets `PATH`. Execs do not start login shells: `/etc/profile`
   resets `PATH` on Debian and Alpine, dropping the image's `ENV PATH`, and `~/.profile` would never
   reach the harness anyway.
+- **User environment probe** (devcontainer `userEnvProbe`, default `loginInteractiveShell`, also
+  for plain images): before each sandbox-user exec (each setup step, the harness, `exec`) the
+  user's login shell from `/etc/passwd` (else `bash`, else `sh`) runs once with `-lic` (`-lc`,
+  `-ic`; `none` skips it) and prints its environment between two copies of a fixed marker
+  (`--agent-sandbox--user-env-probe--`); what lies between the first and the last one is the
+  environment, so rc-file output is ignored; `timeout 10` caps it where available. What differs
+  from the image's environment applies below `remoteEnv` and the toolkit's and `[env]` variables
+  (`PWD`, `OLDPWD`, `SHLVL`, `_` dropped). Its `PATH` gets back the image's entries the profile
+  dropped, in place (like the devcontainers CLI's `mergePaths`). This is how what Features and
+  setup commands put only in rc files (pipx-based Features such as poetry append to
+  `/etc/bash.bashrc`, rustup to `~/.profile`) reaches non-interactive commands such as
+  `sh -c "poetry sync"`. A failed probe warns and adds nothing. Root execs are not probed.
 - Default command: `harness` from config (shlex-split). If it is not installed: print an error and
   start `bash` (or `sh`). `exec -- CMD` runs arbitrary commands (a second harness, tmux).
 - `root`: `exec --user 0` with a prominent banner (setup only; do not run harnesses; root in a
@@ -368,6 +380,7 @@ people working in the project's dev container and the agent get the same environ
 |---|---|
 | `containerEnv` | already `ENV` in the image |
 | `remoteEnv` | exec environment (merged in label order; `[env]` from config.toml wins) |
+| `userEnvProbe` | the user environment probe, see the workspace container (last value wins) |
 | `remoteUser` | user layer, see above; `containerUser` is ignored |
 | `onCreateCommand`, `updateContentCommand`, `postCreateCommand` | setup layer, create phase |
 | `postStartCommand` | setup layer, every container start |
@@ -394,7 +407,8 @@ others become the default (or empty) with a warning; anything else is left as is
   first). Every command is a separate process, as in the CLI (`runRemoteCommand` with
   `/bin/sh -c` or the array, on a PTY), so nothing it exports reaches the harness; that holds for
   `postAttachCommand` too.
-- Runs as the sandbox user with the normal exec environment (plus `remoteEnv`), in the workspace
+- Runs as the sandbox user with the normal exec environment (plus the probed one, probed
+  again before each command, and `remoteEnv`), in the workspace
   root, no TTY. Only the **create phase** gets the `net` tier (base + `allow.extra`), and only
   through the proxy: it cannot have a direct route, because the workspace (agent-written, e.g.
   dependency build hooks) and the state volumes (harness credentials) are already mounted. The

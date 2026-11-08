@@ -210,6 +210,111 @@ def test_exec_env_puts_local_bin_on_the_path(configured: Path) -> None:
     assert path_of(sandbox.exec_env(ctx, "/home/dev", remote, path="/usr/bin")) == ["PATH=/mine"]
 
 
+def probing(
+    engine: FakeEngine, ctx: Context, found: dict[str, str], *, code: int = 0
+) -> list[tuple[str, ...]]:
+    """Answers the probe exec with `found` as the shell's environment; returns the calls."""
+    calls: list[tuple[str, ...]] = []
+
+    def answer(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        marker = sandbox.PROBE_MARKER
+        environ = "".join(f"{k}={v}\0" for k, v in found.items())
+        out = f"rc output\n{marker}{environ}{marker}logout output\n"
+        return subprocess.CompletedProcess(list(args), code, out, "")
+
+    engine.on(("exec", "--user", "1000:1000", "--workdir", str(ctx.project.root)), answer)
+    return calls
+
+
+def probe_container(engine: FakeEngine, ctx: Context, metadata: list[dict[str, object]]) -> None:
+    engine.add("container", ctx.project.workspace_container,
+               {"devcontainer.metadata": json.dumps(metadata)}, Id="c")  # fmt: skip
+    info = engine.objects[("container", ctx.project.workspace_container)]
+    info["Config"]["Env"] = ["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"]
+
+
+def test_probe_user_env_keeps_what_the_shell_adds(configured: Path) -> None:
+    engine = FakeEngine()
+    ctx = make_ctx(configured, engine)
+    probe_container(engine, ctx, [])
+    calls = probing(engine, ctx, {
+        "PATH": "/usr/bin:/opt/tool/bin", "LANG": "C.UTF-8", "PWD": "/x", "SHLVL": "2",
+        "_": "/usr/bin/cat", "TOOL_HOME": "/opt/tool", "MULTI": "a=b\nc",
+        "TRICKY": f"x{sandbox.PROBE_MARKER}y",
+    })  # fmt: skip
+    probed = sandbox.probe_user_env(ctx, sandbox.session(ctx))
+    assert probed == {
+        "PATH": "/usr/bin:/opt/tool/bin", "TOOL_HOME": "/opt/tool", "MULTI": "a=b\nc",
+        "TRICKY": f"x{sandbox.PROBE_MARKER}y",
+    }  # fmt: skip
+    (args,) = calls
+    assert args[args.index("sh") : args.index("sh") + 2] == ("sh", "-c")
+    assert args[-3:-1] == (str(sandbox.PROBE_TIMEOUT), "-lic")  # the spec's default
+    assert "PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin" in args
+
+
+def test_probe_user_env_follows_the_devcontainer_setting(configured: Path) -> None:
+    engine = FakeEngine()
+    config = ProjectConfig(devcontainer=".devcontainer/devcontainer.json")
+    ctx = make_ctx(configured, engine, config=config)
+    probe_container(engine, ctx, [{"userEnvProbe": "interactiveShell"}])
+    calls = probing(engine, ctx, {"A": "1"})
+    assert sandbox.probe_user_env(ctx, sandbox.session(ctx)) == {"A": "1"}
+    assert calls[-1][-2] == "-ic"
+    probe_container(engine, ctx, [{"userEnvProbe": "none"}])
+    assert sandbox.probe_user_env(ctx, sandbox.session(ctx)) == {}
+    assert len(calls) == 1  # not probed
+    ctx.config.devcontainer, ctx.config.image = None, IMAGE  # plain images: the label is ignored
+    assert sandbox.probe_user_env(ctx, sandbox.session(ctx)) == {"A": "1"}
+    assert calls[-1][-2] == "-lic"
+
+
+def test_failed_probe_warns_and_adds_nothing(
+    configured: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    engine = FakeEngine()
+    ctx = make_ctx(configured, engine)
+    probe_container(engine, ctx, [])
+    probing(engine, ctx, {"A": "1"}, code=124)
+    assert sandbox.probe_user_env(ctx, sandbox.session(ctx)) == {}
+    assert "probing the user's shell environment (loginInteractiveShell) failed" in (
+        capsys.readouterr().err
+    )
+    engine.on(("exec", "--user", "1000:1000", "--workdir"), lambda args: "no markers\n")
+    assert sandbox.probe_user_env(ctx, sandbox.session(ctx)) == {}
+    assert "exit code 0" in capsys.readouterr().err
+
+
+def test_merge_paths_puts_back_what_the_shell_dropped() -> None:
+    # /etc/profile on Debian: the image's /opt/go/bin and sbin dirs are gone
+    shell = "/usr/local/bin:/usr/bin:/bin:/usr/games:/opt/rc/bin"
+    image = "/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+    assert sandbox.merge_paths(shell, image) == (
+        "/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:/usr/games:/opt/rc/bin"
+    )
+    assert sandbox.merge_paths("/a:/b", "/a:/b") == "/a:/b"
+
+
+def test_user_exec_env_layers_probe_below_remote_env_and_toolkit(configured: Path) -> None:
+    engine = FakeEngine()
+    config = ProjectConfig(devcontainer=".devcontainer/devcontainer.json")
+    ctx = make_ctx(configured, engine, config=config)
+    probe_container(engine, ctx, [{"remoteEnv": {"BOTH": "remote"}}])
+    probing(engine, ctx, {
+        "PATH": "/usr/bin:/bin:/opt/rc/bin", "BOTH": "probe", "ONLY": "probe",
+        "HTTPS_PROXY": "http://evil:1",
+    })  # fmt: skip
+    args = sandbox.user_exec_env(ctx, sandbox.session(ctx))
+    pairs = [args[i + 1] for i in range(0, len(args), 2)]
+    assert "PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/rc/bin" in pairs
+    assert "BOTH=remote" in pairs and "ONLY=probe" in pairs and "BOTH=probe" not in pairs
+    assert "HTTPS_PROXY=http://proxy:8888" in pairs and not any("evil" in p for p in pairs)
+    ctx.config.env_set["ONLY"] = "mine"
+    args = sandbox.user_exec_env(ctx, sandbox.session(ctx))
+    assert "ONLY=mine" in args and "ONLY=probe" not in args
+
+
 def test_resolve_command(configured: Path) -> None:
     engine = FakeEngine()
     found = {"claude"}

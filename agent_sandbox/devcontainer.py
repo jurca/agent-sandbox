@@ -382,6 +382,16 @@ def remote_env(metadata: list[dict[str, Any]]) -> dict[str, str | None]:
     return merged
 
 
+USER_ENV_PROBES = ("none", "loginShell", "interactiveShell", "loginInteractiveShell")
+DEFAULT_USER_ENV_PROBE = "loginInteractiveShell"
+
+
+def user_env_probe(metadata: list[dict[str, Any]]) -> str:
+    """The last valid `userEnvProbe` (the spec's default when none is set)."""
+    values = [e["userEnvProbe"] for e in metadata if e.get("userEnvProbe") in USER_ENV_PROBES]
+    return values[-1] if values else DEFAULT_USER_ENV_PROBE
+
+
 def steps(metadata: list[dict[str, Any]], hook: str) -> list[Step]:
     found: list[Step] = []
     for entry in metadata:

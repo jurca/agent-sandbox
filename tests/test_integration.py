@@ -852,6 +852,27 @@ def test_setup_runs_before_the_harness_with_allow_extra(env: Env, scratch: Path)
     assert (scratch / "setup-ran").read_text() == "run\nrun\nrun\n"
 
 
+def test_what_rc_files_set_up_reaches_setup_and_execs(env: Env, scratch: Path) -> None:
+    append_config(
+        scratch,
+        "[setup]\ncreate = [\n"
+        "  \"mkdir -p ~/rc-bin && printf '#!/bin/sh\\\\necho from-rc\\\\n' > ~/rc-bin/rc-tool\",\n"
+        '  "chmod +x ~/rc-bin/rc-tool",\n'
+        "  \"echo 'export PATH=$PATH:$HOME/rc-bin RC_VAR=1' >> ~/.bashrc\",\n"
+        '  "rc-tool > rc-ran",\n'  # the step after the rc change already sees it
+        "]\n",
+    )
+    approve(env, scratch)
+    ok(env, scratch)
+    assert (scratch / "rc-ran").read_text() == "from-rc\n"
+    out = sh(env, scratch, 'rc-tool; echo "$RC_VAR"; echo "$PATH"')
+    tool, var, path = out.splitlines()
+    assert (tool, var) == ("from-rc", "1")
+    # /etc/profile resets PATH; what the image had is put back, ~/.local/bin stays in front
+    assert path.startswith(f"{sh(env, scratch, 'echo $HOME').strip()}/.local/bin:"), path
+    assert "/usr/local/bin" in path.split(":") and path.endswith("/rc-bin"), path
+
+
 def test_failed_setup_keeps_the_harness_from_starting(env: Env, scratch: Path) -> None:
     append_config(scratch, '[setup]\ncreate = ["test -f allow-setup"]\n')
     approve(env, scratch)
@@ -934,11 +955,16 @@ def test_devcontainer_flow(env: Env, scratch: Path) -> None:
     }))  # fmt: skip
     (dc / "hello" / "install.sh").write_text(
         "#!/bin/sh\nset -e\necho hi > /usr/local/bin/hello-from-feature\n"
+        # Like the pipx-based Features (e.g. poetry): PATH only in the bashrc, not in ENV.
+        "mkdir -p /opt/hello/bin\n"
+        "printf '#!/bin/sh\\necho from-rc\\n' > /opt/hello/bin/hello-rc\n"
+        "chmod +x /opt/hello/bin/hello-rc\n"
+        "echo 'export PATH=\"$PATH:/opt/hello/bin\"' >> /etc/bash.bashrc\n"
     )
     (dc / "devcontainer.json").write_text(json.dumps({
         "image": DEVCONTAINER_IMAGE, "remoteUser": "dev", "features": {"./hello": {}},
         "remoteEnv": {"FROM_DC": "${localWorkspaceFolderBasename}"},
-        "postCreateCommand": "echo created >> dc-created",
+        "postCreateCommand": "echo created >> dc-created && hello-rc >> dc-created",
         "postAttachCommand": "echo attach >> dc-attached",
         "runArgs": ["--privileged"],
     }))  # fmt: skip
@@ -962,14 +988,16 @@ def test_devcontainer_flow(env: Env, scratch: Path) -> None:
         assert second.code == 0, second.output
         assert "runArgs is not applied" in second.output
         assert f"{DEVCONTAINER_IMAGE} is not pinned" in second.output
-        assert (scratch / "dc-created").read_text() == "feature\ncreated\n"
+        assert (scratch / "dc-created").read_text() == "feature\ncreated\nfrom-rc\n"
         assert (scratch / "dc-attached").read_text() == "attach\n"
         out = sh(
-            env, scratch, 'id -un; echo "$HELLO $FROM_DC"; cat /usr/local/bin/hello-from-feature'
+            env,
+            scratch,
+            'id -un; echo "$HELLO $FROM_DC"; cat /usr/local/bin/hello-from-feature; hello-rc',
         )
-        assert out == f"dev\n1 {scratch.name}\nhi\n"
+        assert out == f"dev\n1 {scratch.name}\nhi\nfrom-rc\n"
         ok(env, scratch)
-        assert (scratch / "dc-created").read_text() == "feature\ncreated\n"
+        assert (scratch / "dc-created").read_text() == "feature\ncreated\nfrom-rc\n"
         assert (scratch / "dc-attached").read_text() == "attach\nattach\n"
         touched = sh(env, scratch, "touch .devcontainer/x 2>/dev/null && echo writable || echo ro")
         assert touched == "ro\n"

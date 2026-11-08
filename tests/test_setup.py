@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from agent_sandbox import devcontainer, net, setup, util
+from agent_sandbox import devcontainer, net, sandbox, setup, util
 from agent_sandbox.config import ProjectConfig
 from agent_sandbox.devcontainer import Step
 from agent_sandbox.net import Observed
@@ -219,6 +219,21 @@ def test_devcontainer_commands_get_variables_and_remote_env(
     assert "==> postCreateCommand from devcontainer.json (one): echo" in err
     setup.before_harness(ctx)
     assert runner.commands[-1] == ["sh", "-c", "attach-cmd"] and len(runner.commands) == 6
+
+
+def test_commands_get_the_probed_environment(repo: Path, runner: Runner, opened: list[str]) -> None:
+    ctx, engine = plain_ctx(repo, setup_create=["poetry sync"])
+    container(engine, ctx)
+
+    def probe(args: tuple[str, ...]) -> str:
+        marker = sandbox.PROBE_MARKER
+        return f"{marker}PATH=/bin:/usr/local/py-utils/bin\0PIPX_HOME=/usr/local/py-utils\0{marker}"
+
+    engine.on(("exec", "--user", "1000:1000", "--workdir", str(repo)), probe)
+    setup.ensure_setup(ctx)
+    argv = runner.argvs[0]
+    assert "PATH=/home/dev/.local/bin:/bin:/usr/local/py-utils/bin" in argv
+    assert "PIPX_HOME=/usr/local/py-utils" in argv
 
 
 def test_config_commands_are_not_substituted(repo: Path, runner: Runner, opened: list[str]) -> None:

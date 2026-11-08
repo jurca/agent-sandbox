@@ -700,6 +700,93 @@ def exec_env(
     return args
 
 
+PROBE_FLAGS = {"loginShell": "-lc", "interactiveShell": "-ic", "loginInteractiveShell": "-lic"}
+PROBE_TIMEOUT = 10  # seconds, where the container has `timeout`
+# Variables of the probing shell itself, not of the user's environment.
+PROBE_IGNORED = frozenset({"PWD", "OLDPWD", "SHLVL", "_"})
+# Fixed, so probe output is recognizable; the environment is taken from its first to its last
+# occurrence, so a value that contains it (or rc output after the probe) cannot cut it short.
+PROBE_MARKER = "--agent-sandbox--user-env-probe--"
+PROBE_COMMAND = f"printf %s '{PROBE_MARKER}'; cat /proc/self/environ; printf %s '{PROBE_MARKER}'"
+
+# The user's login shell from /etc/passwd (bash, else sh, if it has none or a nologin one) runs
+# the command in $2 (PROBE_COMMAND) with the flags in $1.
+_PROBE = r"""
+shell=$(awk -F: -v u="$(id -u)" '$3 == u { print $7; exit }' /etc/passwd 2>/dev/null)
+case $shell in ""|*/nologin|*/false) shell= ;; esac
+if [ -z "$shell" ] || [ ! -x "$shell" ]; then
+  if command -v bash >/dev/null 2>&1; then shell=bash; else shell=sh; fi
+fi
+if command -v timeout >/dev/null 2>&1; then exec timeout "$0" "$shell" "$1" "$2"; fi
+exec "$shell" "$1" "$2"
+"""
+
+
+def probe_user_env(ctx: Context, current: Session) -> dict[str, str]:
+    """The environment the user's shell sets up (devcontainer `userEnvProbe`): what Features
+    and setup commands add in rc files (`/etc/bash.bashrc`, `~/.bashrc`, `/etc/profile.d`).
+    Only what differs from the image's environment is returned; a failed probe warns and
+    returns nothing."""
+    mode = (
+        devcontainer.user_env_probe(current.metadata)
+        if ctx.config.devcontainer is not None
+        else devcontainer.DEFAULT_USER_ENV_PROBE
+    )
+    flags = PROBE_FLAGS.get(mode)
+    if flags is None:
+        return {}
+    env = exec_env(ctx, current.home, path=current.image_env.get("PATH", ""))
+    result = ctx.engine.run(
+        "exec", "--user", f"{ctx.uid}:{ctx.gid}", "--workdir", str(ctx.project.root), *env,
+        ctx.project.workspace_container, "sh", "-c", _PROBE, str(PROBE_TIMEOUT), flags,
+        PROBE_COMMAND,
+        check=False,
+    )  # fmt: skip
+    out = result.stdout or ""
+    start, end = out.find(PROBE_MARKER), out.rfind(PROBE_MARKER)
+    if result.returncode != 0 or start == end:  # also when it is not there at all (-1)
+        hint = (
+            ' Set "userEnvProbe": "none" in devcontainer.json to skip the probe.'
+            if ctx.config.devcontainer is not None
+            else ""
+        )
+        eprint(
+            f"warning: probing the user's shell environment ({mode}) failed (exit code "
+            f"{result.returncode}); what rc files add (e.g. to PATH) is missing.{hint}"
+        )
+        return {}
+    found: dict[str, str] = {}
+    for entry in out[start + len(PROBE_MARKER) : end].split("\0"):
+        key, sep, value = entry.partition("=")
+        if sep and key and key not in PROBE_IGNORED and current.image_env.get(key) != value:
+            found[key] = value
+    return found
+
+
+def merge_paths(shell_path: str, container_path: str) -> str:
+    """The shell's PATH with the container's entries it dropped put back in place (a login
+    shell's `/etc/profile` resets PATH on Debian and Alpine), like the devcontainers CLI."""
+    result = [p for p in shell_path.split(":") if p]
+    insert_at = 0
+    for entry in dict.fromkeys(p for p in container_path.split(":") if p):
+        if entry in result:
+            insert_at = result.index(entry) + 1
+        else:
+            result.insert(insert_at, entry)
+            insert_at += 1
+    return ":".join(result)
+
+
+def user_exec_env(ctx: Context, current: Session) -> list[str]:
+    """Environment arguments for the sandbox user: the image's environment, then the probed
+    one, then remoteEnv, then the toolkit's own and the configured variables."""
+    probed = probe_user_env(ctx, current)
+    path = current.image_env.get("PATH", "")
+    if "PATH" in probed:
+        path = merge_paths(probed.pop("PATH"), path or DEFAULT_PATH)
+    return exec_env(ctx, current.home, {**probed, **remote_env(ctx, current)}, path=path)
+
+
 SHELL_FALLBACK = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]
 
 ROOT_BANNER = """\
@@ -765,7 +852,7 @@ def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bo
         argv = ["sh", "-c", 'printf "%s" "$AGENT_SANDBOX_BANNER" >&2; exec "$@"', "sh"]
         argv += command or SHELL_FALLBACK
     else:
-        env = exec_env(ctx, home, remote_env(ctx, current), path=current.image_env.get("PATH", ""))
+        env = user_exec_env(ctx, current)
         args += env
         argv = command_with_umask(_resolve_command(ctx, command, env), ctx.umask)
     ctx.engine.exec_replace([*args, ctx.project.workspace_container, *argv])

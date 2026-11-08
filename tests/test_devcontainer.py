@@ -82,6 +82,12 @@ def test_remote_env_merges_in_order() -> None:
     assert devcontainer.remote_env(METADATA) == {"HOST_HOME": "${localEnv:HOME}", "DROP": None}
 
 
+def test_user_env_probe_takes_the_last_valid_value() -> None:
+    assert devcontainer.user_env_probe([]) == "loginInteractiveShell"
+    metadata = [{"userEnvProbe": "none"}, {"userEnvProbe": "interactiveShell"}, {"userEnvProbe": 1}]
+    assert devcontainer.user_env_probe(metadata) == "interactiveShell"
+
+
 def test_steps_keep_origin_and_order() -> None:
     assert devcontainer.steps(METADATA, "postStartCommand") == [
         Step(
