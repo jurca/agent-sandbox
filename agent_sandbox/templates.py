@@ -66,7 +66,7 @@ paths = [".claude", ".copilot", ".cache/pre-commit"]
 # container before the first harness start, with the hosts in allow.extra reachable; `start`
 # runs once per container start.
 # [setup]
-# create = ["uv sync", "pre-commit install-hooks"]
+# create = ["uv sync", ".venv/bin/pre-commit install-hooks"]
 # start = []
 """
 
