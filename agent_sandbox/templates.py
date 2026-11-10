@@ -6,12 +6,17 @@ CONFIG_TOML = """\
 # agent-sandbox configuration. It is committed with the repository; after any change the
 # host asks you to approve it before it takes effect (see `agent-sandbox help config`).
 
-image = "{image}"
-
 # Command line started by a plain `agent-sandbox`; a shell is started if it is not installed.
 # harness = "claude"
 # harness = "copilot"
 harness = "bash"
+
+image = "{image}"
+
+# Instead of `image`: build the base from the project's devcontainer (remove `image` above).
+# [devcontainer]
+# enabled = true
+# config = ".devcontainer/devcontainer.json"
 
 [env]
 # Host variables passed into the container when they are set on the host.
@@ -63,11 +68,6 @@ paths = [".claude", ".copilot", ".cache/pre-commit"]
 # [setup]
 # create = ["uv sync", "pre-commit install-hooks"]
 # start = []
-
-# Instead of `image`: build the base from the project's devcontainer (remove `image` above).
-# [devcontainer]
-# enabled = true
-# config = ".devcontainer/devcontainer.json"
 """
 
 TINYPROXY_CONF = """\
