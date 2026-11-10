@@ -39,11 +39,12 @@ class MountSpec:
 
     `source` is an absolute host path (`~` already expanded). `target` is absolute, or starts
     with `~` / `{home}` for the container user's home directory, which is only known once the
-    image is built.
+    image is built. `check_secrets` false skips the secret file check of this mount.
     """
 
     source: str
     target: str
+    check_secrets: bool = True
 
 
 @dataclass
@@ -258,7 +259,7 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
     for index, entry in enumerate(raw_mounts, start=1):
         if not isinstance(entry, dict):
             raise SandboxError(f"{where}: mounts entry {index} must be a table.")
-        _only(entry, {"source", "target"}, f"{where} [[mounts]] #{index}")
+        _only(entry, {"source", "target", "check_secrets"}, f"{where} [[mounts]] #{index}")
         source, target = entry.get("source"), entry.get("target", entry.get("source"))
         if not isinstance(source, str) or not isinstance(target, str):
             raise SandboxError(f"{where}: mounts entry {index} needs string `source` and `target`.")
@@ -272,7 +273,14 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
                 f"{where}: mounts entry {index}: target must be absolute or start with "
                 "`~` or `{home}`."
             )
-        mounts.append(MountSpec(source.rstrip("/") or "/", target.rstrip("/") or "/"))
+        check_secrets = entry.get("check_secrets", True)
+        if not isinstance(check_secrets, bool):
+            raise SandboxError(
+                f"{where}: mounts entry {index}: check_secrets must be true or false."
+            )
+        mounts.append(
+            MountSpec(source.rstrip("/") or "/", target.rstrip("/") or "/", check_secrets)
+        )
 
     workspace = _table(data, "workspace", where)
     _only(

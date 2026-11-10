@@ -36,7 +36,10 @@ def test_full_project_config() -> None:
             "image": "img",
             "harness": "claude --verbose",
             "env": {"pass": ["TERM"], "set": {"A": "{home}/x"}},
-            "mounts": [{"source": "/data/", "target": "/mnt/data"}, {"source": "/opt"}],
+            "mounts": [
+                {"source": "/data/", "target": "/mnt/data"},
+                {"source": "/opt", "check_secrets": False},
+            ],
             "state": {"paths": [".claude", ".config/foo"]},
             "workspace": {"protected": [".claude/", "./.envrc"], "isolated": ["web/node_modules"]},
             "proxy": {"base_image": "mirror/alpine:3"},
@@ -47,7 +50,7 @@ def test_full_project_config() -> None:
     assert cfg.harness == "claude --verbose"
     assert cfg.env_pass == ["TERM"]
     assert cfg.env_set == {"A": "{home}/x"}
-    assert cfg.mounts == [MountSpec("/data", "/mnt/data"), MountSpec("/opt", "/opt")]
+    assert cfg.mounts == [MountSpec("/data", "/mnt/data"), MountSpec("/opt", "/opt", False)]
     assert cfg.state_paths == [".claude", ".config/foo"]
     assert cfg.proxy_base_image == "mirror/alpine:3"
 
@@ -91,6 +94,7 @@ def test_full_project_config() -> None:
         ({"image": "i", "mounts": {"source": "/a"}}, "array of tables"),
         ({"image": "i", "mounts": ["/a"]}, "must be a table"),
         ({"image": "i", "mounts": [{"source": "/a", "mode": "rw"}]}, "unknown key"),
+        ({"image": "i", "mounts": [{"source": "/a", "check_secrets": "no"}]}, "true or false"),
         ({"image": "i", "mounts": [{"target": "/a"}]}, "string `source`"),
         ({"image": "i", "mounts": [{"source": "rel"}]}, "absolute"),
         ({"image": "i", "mounts": [{"source": "{home}/x"}]}, "source must be absolute"),

@@ -148,6 +148,42 @@ def test_extra_mounts_are_checked_for_real_files_only(repo: Path, tmp_path: Path
     assert "extra mount" in found[0].problem
 
 
+def test_extra_mount_check_can_be_turned_off(repo: Path, tmp_path: Path) -> None:
+    mounted = tmp_path / "data"
+    mounted.mkdir()
+    (mounted / ".env").write_text("x")
+    config = ProjectConfig(mounts=[MountSpec(str(mounted), "/m", check_secrets=False)])
+    assert run_check(repo, config) == []
+
+
+def test_extra_mount_scan_is_bounded(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mounted = tmp_path / "huge"
+    for index in range(5):
+        (mounted / f"d{index}").mkdir(parents=True)
+    (mounted / "d0" / ".env").write_text("x")
+    monkeypatch.setattr(secretfiles, "SCAN_MAX_ENTRIES", 3)
+    found = run_check(repo, ProjectConfig(mounts=[MountSpec(str(mounted), "/m")]))
+    assert found == []
+    err = capsys.readouterr().err
+    assert f"Scanning for secret files in {mounted}..." in err
+    assert "stopped early after" in err and "check_secrets = false" in err
+
+
+def test_interrupted_mount_scan_says_so(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(secretfiles, "_scan", interrupt)
+    config = ProjectConfig(mounts=[MountSpec(str(tmp_path), "/m")])
+    with pytest.raises(KeyboardInterrupt):
+        secretfiles._mount_findings(config.mounts[0], config)
+    assert capsys.readouterr().err.endswith("Interrupted.\n")
+
+
 # --- git --------------------------------------------------------------------------------
 
 

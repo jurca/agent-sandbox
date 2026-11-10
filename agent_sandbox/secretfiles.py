@@ -11,13 +11,16 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
-from .config import ProjectConfig
+from .config import MountSpec, ProjectConfig
+from .mounts import SCAN_MAX_ENTRIES, SCAN_MAX_SECONDS
 from .project import host_git
-from .util import SandboxError, config_dir, state_dir
+from .util import SandboxError, config_dir, eprint, state_dir
 
 PROBE = "agent-sandbox-probe"
 COPY_CHUNK = 1 << 16
@@ -52,16 +55,30 @@ def is_secret_name(name: str, config: ProjectConfig) -> bool:
     return any(fnmatchcase(name, pattern) for pattern in config.secrets)
 
 
+@dataclass
+class _Scan:
+    matches: list[Path] = dataclass_field(default_factory=list)
+    unreadable: list[Path] = dataclass_field(default_factory=list)
+    complete: bool = True
+    entries: int = 0
+
+
 def _scan(
-    root: Path, config: ProjectConfig, skip: frozenset[str] = frozenset()
-) -> tuple[list[Path], list[Path]]:
+    root: Path,
+    config: ProjectConfig,
+    skip: frozenset[str] = frozenset(),
+    *,
+    max_entries: int | None = None,
+    max_seconds: float | None = None,
+) -> _Scan:
     """Matching non-directories below `root`, and the directories that could not be listed.
 
     Symlinks are never followed. `skip` holds directories relative to `root`. Every `.git` is
-    left out: object names cannot match, and it is the slowest part of a workspace.
+    left out: object names cannot match, and it is the slowest part of a workspace. With a
+    budget, the scan stops once it has seen `max_entries` entries or spent `max_seconds`.
     """
-    matches: list[Path] = []
-    unreadable: list[Path] = []
+    result = _Scan()
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
     stack = [root]
     while stack:
         current = stack.pop()
@@ -69,16 +86,25 @@ def _scan(
             with os.scandir(current) as iterator:
                 entries = list(iterator)
         except OSError:
-            unreadable.append(current)
+            result.unreadable.append(current)
             continue
         for entry in entries:
+            if (max_entries is not None and result.entries >= max_entries) or (
+                deadline is not None and result.entries % 256 == 0 and time.monotonic() > deadline
+            ):
+                result.complete = False
+                stack.clear()
+                break
+            result.entries += 1
             path = Path(entry.path)
             if entry.is_dir(follow_symlinks=False):
                 if entry.name != ".git" and str(path.relative_to(root)) not in skip:
                     stack.append(path)
             elif is_secret_name(entry.name, config):
-                matches.append(path)
-    return sorted(matches), sorted(unreadable)
+                result.matches.append(path)
+    result.matches.sort()
+    result.unreadable.sort()
+    return result
 
 
 def _link_finding(path: Path, shown: str) -> Finding | None:
@@ -311,7 +337,8 @@ def check(root: Path, project_id: str, config: ProjectConfig, *, history: bool) 
         )
     secrets.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    matches, unreadable = _scan(root, config, frozenset(config.isolated))
+    scan = _scan(root, config, frozenset(config.isolated))
+    matches = scan.matches
     findings = [
         Finding(
             str(path),
@@ -319,7 +346,7 @@ def check(root: Path, project_id: str, config: ProjectConfig, *, history: bool) 
             "fix its permissions (`agent-sandbox repair` if the sandbox made it), "
             "or add it to [workspace] isolated",
         )
-        for path in unreadable
+        for path in scan.unreadable
     ]
     relative = [str(path.relative_to(root)) for path in matches]
     for path, shown in zip(matches, relative, strict=True):
@@ -330,17 +357,37 @@ def check(root: Path, project_id: str, config: ProjectConfig, *, history: bool) 
         elif finding := _link_finding(path, shown):
             findings.append(finding)
     for spec in config.mounts:
-        findings += _mount_findings(Path(spec.source), config)
+        findings += _mount_findings(spec, config)
     findings += _git_findings(root, relative, config)
     if history:
         findings += _history_findings(root, project_id, config)
     return findings
 
 
-def _mount_findings(source: Path, config: ProjectConfig) -> list[Finding]:
-    """An extra mount puts its files in the sandbox as well. Git rules do not apply to it."""
+def _mount_findings(spec: MountSpec, config: ProjectConfig) -> list[Finding]:
+    """An extra mount puts its files in the sandbox as well. Git rules do not apply to it.
+
+    The scan is bounded like the socket scan: a mount can be a huge network file system.
+    """
+    source = Path(spec.source)
+    if not spec.check_secrets:
+        return []
     if source.is_dir():
-        matches, unreadable = _scan(source.resolve(), config)
+        eprint(f"Scanning for secret files in {source}...")
+        try:
+            scan = _scan(
+                source.resolve(), config, max_entries=SCAN_MAX_ENTRIES, max_seconds=SCAN_MAX_SECONDS
+            )
+        except KeyboardInterrupt:
+            eprint("Interrupted.")
+            raise
+        if not scan.complete:
+            eprint(
+                f"note: scanning {source} for secret files stopped early after {scan.entries} "
+                "entries; files deeper in the tree were not checked. Set `check_secrets = false` "
+                "on this mount to skip the scan."
+            )
+        matches, unreadable = scan.matches, scan.unreadable
     elif source.exists() and is_secret_name(source.resolve().name, config):
         matches, unreadable = [source], []
     else:
@@ -414,7 +461,7 @@ def _replace_with_link(path: Path, target: Path) -> None:
 
 def adopt(root: Path, project_id: str, config: ProjectConfig, *, dry_run: bool) -> list[Adoption]:
     """Move real secret files to the secrets directory and leave symlinks behind."""
-    matches, _ = _scan(root, config, frozenset(config.isolated))
+    matches = _scan(root, config, frozenset(config.isolated)).matches
     real = [path for path in matches if not path.is_symlink()]
     relative = [str(path.relative_to(root)) for path in real]
     tracked, error = _tracked(root, relative)

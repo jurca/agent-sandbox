@@ -121,7 +121,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
   [workspace] secrets_history_depth
                    also search this many newest commits when creating the sandbox (default: off)
   [[mounts]]       extra read-only bind mounts: source, target (default: source); `~` is
-                   your home in source and the container home in target
+                   your home in source and the container home in target; check_secrets = false
+                   skips the (bounded) secret file check of the mount
   [state] paths    directories under the container home kept in a volume
                    (per workspace by default; default: .claude .copilot .cache/pre-commit)
   [proxy] base_image   image tinyproxy is installed on (default: alpine:3)

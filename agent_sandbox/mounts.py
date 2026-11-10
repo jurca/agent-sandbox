@@ -15,6 +15,9 @@ from .config import PROJECT_DIR, MountSpec
 from .util import SandboxError, config_dir, runtime_dir, state_dir
 
 ACL_BATCH = 200
+# How much of an extra mount's tree the socket and secret file scans look at, each.
+SCAN_MAX_ENTRIES = 50_000
+SCAN_MAX_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -131,7 +134,7 @@ class ScanResult:
 
 
 def scan_for_sockets(
-    root: Path, *, max_entries: int = 50_000, max_seconds: float = 5.0
+    root: Path, *, max_entries: int = SCAN_MAX_ENTRIES, max_seconds: float = SCAN_MAX_SECONDS
 ) -> ScanResult:
     """Find unix sockets below `root` without following symlinks, within a budget."""
     result = ScanResult()
