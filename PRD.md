@@ -682,8 +682,7 @@ secrets already committed, unless the history check finds them: the agent can re
 
 ## 12. Deferred / out of scope for v1
 
-OpenCode defaults; replacing the user's separate
-`workspace-sandbox` scripts (to be revisited after solo testing); Podman and rootful verification;
+OpenCode defaults; Podman and rootful verification;
 Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
 user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
 project config); resolving symlinks inside mounted skill directories (links pointing outside the
