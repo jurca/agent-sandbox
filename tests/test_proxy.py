@@ -143,13 +143,20 @@ def test_upstream_render() -> None:
 
 def test_parse_no_proxy_like_the_corporate_value() -> None:
     specs, direct_all, warnings = parse_no_proxy(
-        ".corp.example,.corp.example.net, 10.0.0.0/8,localhost,127.0.0.1,*.corp.example.org,Foo.Example,"
-        "10.1.2.3/16,::1,[fd00::1],host:8080,bad_host!,999.1.1.1/8,.corp.example"
+        ".corp.example,.corp.example.net, 10.0.0.0/8,localhost,127.0.0.1,*.corp.example.org,"
+        "Foo.Example,10.1.2.3/16,::1,[fd00::1],host:8080,bad_host!,999.1.1.1/8,.corp.example"
     )
     assert specs == (
-        ".corp.example", ".corp.example.net", "10.0.0.0/8", ".localhost", "127.0.0.1", ".corp.example.org",
-        ".foo.example", "10.1.0.0/16", ".host",
-    )  # fmt: skip
+        ".corp.example",
+        ".corp.example.net",
+        "10.0.0.0/8",
+        ".localhost",
+        "127.0.0.1",
+        ".corp.example.org",
+        ".foo.example",
+        "10.1.0.0/16",
+        ".host",
+    )
     assert not direct_all
     assert len(warnings) == 5
     assert any("ports" in w for w in warnings)
@@ -285,8 +292,18 @@ def test_upstream_lines_allow_all_null_routes_internal() -> None:
     lines = upstream_lines(CORP, allow_all=True, allowlist=["api.anthropic.com"])
     assert route(lines, "example.com") == UP
     assert route(lines, "api.anthropic.com") == UP
-    for host in ("git.corp.example", "corp.example", "10.1.2.3", "192.168.0.1", "127.0.0.1", "localhost",
-                 "x.localhost", "169.254.169.254", "100.64.0.1", "172.16.5.5"):  # fmt: skip
+    for host in (
+        "git.corp.example",
+        "corp.example",
+        "10.1.2.3",
+        "192.168.0.1",
+        "127.0.0.1",
+        "localhost",
+        "x.localhost",
+        "169.254.169.254",
+        "100.64.0.1",
+        "172.16.5.5",
+    ):
         assert route(lines, host) == NULL, host
 
 

@@ -66,7 +66,9 @@ def test_observed_allow_all_mode() -> None:
     assert seen.add(LogEvent("request", "api.github.com")) is None
     assert seen.add(LogEvent("request", "pypi.org")) == "outside allowlists: pypi.org"
     assert seen.add(LogEvent("request", "pypi.org")) is None
-    assert seen.add(LogEvent("request", "git.corp.example")) == "blocked (internal): git.corp.example"
+    assert (
+        seen.add(LogEvent("request", "git.corp.example")) == "blocked (internal): git.corp.example"
+    )
     assert seen.add(LogEvent("request", "10.0.0.1")) == "blocked (internal): 10.0.0.1"
     assert seen.candidates() == [("pypi.org", 2)]
 
