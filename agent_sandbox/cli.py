@@ -103,7 +103,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
                    instead of `image`: build the base from the project's devcontainer
                    (see `help setup`); config = ".devcontainer/<name>/devcontainer.json"
                    picks another one than .devcontainer/devcontainer.json
-  harness          command line started by a plain `agent-sandbox`
+  harness          command line, or list of them, started by a plain `agent-sandbox`: the
+                   first one installed in the container (default: claude copilot bash sh)
   [env] pass       host variables to pass into the container (when set)
   [env.set]        fixed variables; {{home}} expands to the container home directory
   [workspace] protected
@@ -141,7 +142,9 @@ User-level configuration: ~/.config/agent-sandbox/config.toml (never in the repo
   git = "ro" | "rw"                          writable .git is a host-side risk, so it can only
                                              be set here
   state_volume = "per-workspace" | "NAME"    "NAME" shares harness logins between workspaces
-  [workspaces."/abs/path"]                   per-workspace overrides of git and state_volume
+  harness = ["copilot"]                      harnesses tried before the project's list
+  [workspaces."/abs/path"]                   per-workspace overrides of git, state_volume and
+                                             harness
   [proxy] base_image = "..."
   devcontainer_cli = ["devcontainer"]        how to run the devcontainers CLI, for example
                                              ["npx", "@devcontainers/cli"]

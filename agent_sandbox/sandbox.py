@@ -9,7 +9,6 @@ import grp
 import hashlib
 import json
 import os
-import shlex
 import shutil
 import sys
 from collections.abc import Generator
@@ -90,6 +89,15 @@ class Context:
     @property
     def state_scope(self) -> str:
         return self.user.state_scope(self.project.root)
+
+    @property
+    def harness(self) -> list[list[str]]:
+        """The user's preferred harnesses first, then the project's, without duplicates."""
+        candidates: list[list[str]] = []
+        for words in [*self.user.harness_preference(self.project.root), *self.config.harness]:
+            if words not in candidates:
+                candidates.append(words)
+        return candidates
 
     @property
     def proxy_base_image(self) -> str:
@@ -806,31 +814,32 @@ ROOT_NOTE_ROOTFUL = (
 )
 
 
+# Prints the index of the first argument that is an installed command.
+_FIRST_INSTALLED = (
+    'i=0; for c; do command -v "$c" >/dev/null 2>&1 && { echo "$i"; exit 0; }; i=$((i+1)); done;'
+    " exit 1"
+)
+
+
 def _resolve_command(ctx: Context, command: list[str] | None, env: list[str]) -> list[str]:
     if command:
         return command
-    harness = ctx.config.harness
-    if harness == "bash":
-        return SHELL_FALLBACK
-    try:
-        words = shlex.split(harness)
-    except ValueError as exc:
-        raise SandboxError(f"Cannot parse harness {harness!r}: {exc}") from exc
-    if not words:
-        return SHELL_FALLBACK
+    candidates = ctx.harness
     probe = ctx.engine.run(
         "exec", "--user", f"{ctx.uid}:{ctx.gid}", *env, ctx.project.workspace_container,
-        "sh", "-c", 'command -v "$1" >/dev/null 2>&1', "sh", words[0],
+        "sh", "-c", _FIRST_INSTALLED, "sh", *(words[0] for words in candidates),
         check=False,
     )  # fmt: skip
-    if probe.returncode != 0:
-        eprint(
-            f"The harness {words[0]!r} was not found in the container.\n"
-            f"Set `harness` in {PROJECT_DIR}/config.toml (and install it in the image or via "
-            "`agent-sandbox root`). Starting a shell instead."
-        )
-        return SHELL_FALLBACK
-    return words
+    if probe.returncode == 0:
+        with contextlib.suppress(ValueError, IndexError):
+            return candidates[int(probe.stdout.strip())]
+    names = ", ".join(repr(words[0]) for words in candidates)
+    eprint(
+        f"No harness was found in the container (tried {names}).\n"
+        f"Set `harness` in {PROJECT_DIR}/config.toml or in the user configuration (and install "
+        "it in the image or via `agent-sandbox root`). Starting a shell instead."
+    )
+    return SHELL_FALLBACK
 
 
 def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bool = False) -> None:

@@ -44,6 +44,7 @@ pytestmark = pytest.mark.integration
 
 LAUNCHER = str(Path(__file__).resolve().parent.parent / "agent-sandbox")
 IMAGE = os.environ.get("ASB_TEST_IMAGE", "python:3.14")
+DEFAULT_HARNESS_LINE = 'harness = ["claude", "copilot", "bash", "sh"]'
 ENGINE = os.environ.get("ASB_TEST_ENGINE", "docker")
 
 PROBE = r"""
@@ -450,11 +451,11 @@ def test_repair_reclaims_files_the_host_cannot_change(env: Env, workspace: Path)
 def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
     config = workspace / ".agent-sandbox" / "config.toml"
     original = config.read_text()
-    config.write_text(original.replace('harness = "bash"', 'harness = "no-such-harness --x"'))
+    config.write_text(original.replace(DEFAULT_HARNESS_LINE, 'harness = "no-such-harness --x"'))
     try:
         approve(env, workspace)
         result = ok(env, workspace, stdin="echo shell-$((1+1))\n")
-        assert "'no-such-harness' was not found" in result.err
+        assert "No harness was found in the container (tried 'no-such-harness')" in result.err
         assert "shell-2" in result.out
     finally:
         config.write_text(original)
@@ -473,11 +474,11 @@ def test_harness_in_local_bin_is_found(env: Env, workspace: Path) -> None:
     )
     config = workspace / ".agent-sandbox" / "config.toml"
     original = config.read_text()
-    config.write_text(original.replace('harness = "bash"', 'harness = "lh"'))
+    config.write_text(original.replace(DEFAULT_HARNESS_LINE, 'harness = "lh"'))
     try:
         approve(env, workspace)
         result = ok(env, workspace)
-        assert "was not found" not in result.err
+        assert "No harness was found" not in result.err
         assert "local-harness" in result.out
     finally:
         config.write_text(original)
@@ -970,7 +971,7 @@ def test_devcontainer_flow(env: Env, scratch: Path) -> None:
     }))  # fmt: skip
     config = scratch / ".agent-sandbox" / "config.toml"
     text = re.sub(r"(?m)^image = .*\n", "", config.read_text())
-    config.write_text(text.replace('harness = "bash"', 'harness = "true"'))
+    config.write_text(text.replace(DEFAULT_HARNESS_LINE, 'harness = "true"'))
     append_config(scratch, "[devcontainer]\nenabled = true\n")
     env.user_config.write_text(f"devcontainer_cli = {json.dumps(cli)}\n")
     try:

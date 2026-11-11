@@ -6,10 +6,10 @@ CONFIG_TOML = """\
 # agent-sandbox configuration. It is committed with the repository; after any change the
 # host asks you to approve it before it takes effect (see `agent-sandbox help config`).
 
-# Command line started by a plain `agent-sandbox`; a shell is started if it is not installed.
-# harness = "claude"
-# harness = "copilot"
-harness = "bash"
+# Command lines tried in order by a plain `agent-sandbox`: the first one installed in the
+# container is started (a shell if none is). A single string works too. Each person can put
+# their preferred harnesses first in the user configuration (see `agent-sandbox help config`).
+harness = ["claude", "copilot", "bash", "sh"]
 
 image = "{image}"
 

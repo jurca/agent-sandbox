@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -21,6 +22,7 @@ DEVCONTAINER_DIR = ".devcontainer"
 DEFAULT_DEVCONTAINER_CONFIG = f"{DEVCONTAINER_DIR}/devcontainer.json"
 DEFAULT_DEVCONTAINER_CLI = ("devcontainer",)
 
+DEFAULT_HARNESS = ("claude", "copilot", "bash", "sh")
 DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
 DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
 DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea", ".devcontainer")
@@ -52,7 +54,8 @@ class ProjectConfig:
     image: str | None = None
     # devcontainer.json (relative to the workspace root) when the devcontainer is the base.
     devcontainer: str | None = None
-    harness: str = "bash"
+    # Candidate command lines (already split), tried in order; the first one installed runs.
+    harness: list[list[str]] = field(default_factory=lambda: _default_harness())
     env_pass: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_PASS))
     env_set: dict[str, str] = field(default_factory=dict)
     mounts: list[MountSpec] = field(default_factory=list)
@@ -74,7 +77,9 @@ class UserConfig:
     allow_rootful: bool = False
     git: str = "ro"
     state_volume: str = "per-workspace"
-    workspaces: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Tried before the project's harness list: a personal preference among installed harnesses.
+    harness: list[list[str]] = field(default_factory=list)
+    workspaces: dict[str, dict[str, Any]] = field(default_factory=dict)
     proxy_base_image: str | None = None
     devcontainer_cli: list[str] = field(default_factory=lambda: list(DEFAULT_DEVCONTAINER_CLI))
 
@@ -83,6 +88,32 @@ class UserConfig:
 
     def state_scope(self, workspace: Path) -> str:
         return self.workspaces.get(str(workspace), {}).get("state_volume", self.state_volume)
+
+    def harness_preference(self, workspace: Path) -> list[list[str]]:
+        return self.workspaces.get(str(workspace), {}).get("harness", self.harness)
+
+
+def _default_harness() -> list[list[str]]:
+    return [[command] for command in DEFAULT_HARNESS]
+
+
+def _harness(value: Any, where: str) -> list[list[str]]:
+    """A command line or a list of them, each split like a shell would (no expansion)."""
+    lines = [value] if isinstance(value, str) else value
+    if not isinstance(lines, list) or not lines or not all(isinstance(v, str) for v in lines):
+        raise SandboxError(
+            f"{where}: `harness` must be a command line or a non-empty list of command lines."
+        )
+    commands: list[list[str]] = []
+    for line in lines:
+        try:
+            words = shlex.split(line)
+        except ValueError as exc:
+            raise SandboxError(f"{where}: cannot parse harness {line!r}: {exc}") from None
+        if not words:
+            raise SandboxError(f"{where}: harness command lines must not be empty.")
+        commands.append(words)
+    return commands
 
 
 def _table(data: dict[str, Any], key: str, where: str) -> dict[str, Any]:
@@ -232,9 +263,7 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
             f"{where}: `image` is required (or `[devcontainer] enabled = true`). "
             "Run `agent-sandbox init --image IMAGE` or set it."
         )
-    harness = data.get("harness", "bash")
-    if not isinstance(harness, str) or not harness.strip():
-        raise SandboxError(f"{where}: `harness` must be a non-empty command line.")
+    harness = _harness(data["harness"], where) if "harness" in data else _default_harness()
 
     env = _table(data, "env", where)
     _only(env, {"pass", "set"}, f"{where} [env]")
@@ -339,7 +368,7 @@ def parse_project_config(data: dict[str, Any], where: str = CONFIG_FILE) -> Proj
     return ProjectConfig(
         image=image.strip() if image is not None else None,
         devcontainer=devcontainer,
-        harness=harness.strip(),
+        harness=harness,
         env_pass=env_pass,
         env_set=dict(env_set_raw),
         mounts=mounts,
@@ -379,10 +408,13 @@ def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserC
             "workspaces",
             "proxy",
             "devcontainer_cli",
+            "harness",
         },
         where,
     )
     config = UserConfig()
+    if "harness" in data:
+        config.harness = _harness(data["harness"], where)
     if "devcontainer_cli" in data:
         command = _string_list(data["devcontainer_cli"], f"{where}: devcontainer_cli")
         if not command or not command[0]:
@@ -407,8 +439,10 @@ def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserC
     for path, table in _table(data, "workspaces", where).items():
         if not isinstance(table, dict):
             raise SandboxError(f'{where}: [workspaces."{path}"] must be a table.')
-        _only(table, {"git", "state_volume"}, f'{where} [workspaces."{path}"]')
-        override: dict[str, str] = {}
+        _only(table, {"git", "state_volume", "harness"}, f'{where} [workspaces."{path}"]')
+        override: dict[str, Any] = {}
+        if "harness" in table:
+            override["harness"] = _harness(table["harness"], f'{where} [workspaces."{path}"]')
         if "git" in table:
             override["git"] = _git_mode(table["git"], where)
         if "state_volume" in table:

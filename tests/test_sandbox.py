@@ -317,18 +317,40 @@ def test_user_exec_env_layers_probe_below_remote_env_and_toolkit(configured: Pat
 
 def test_resolve_command(configured: Path) -> None:
     engine = FakeEngine()
-    found = {"claude"}
-    engine.on(("exec",), lambda args: 0 if args[-1] in found else 1)
-    ctx = make_ctx(configured, engine, config=ProjectConfig(image=IMAGE, harness="claude -c"))
+    found = {"claude", "bash"}
+
+    def probe(args: tuple[str, ...]) -> str | int:
+        names = args[args.index("-c") + 3 :]  # after the script and $0
+        for index, name in enumerate(names):
+            if name in found:
+                return f"{index}\n"
+        return 1
+
+    engine.on(("exec",), probe)
+    config = ProjectConfig(image=IMAGE, harness=[["copilot"], ["claude", "-c"], ["bash"]])
+    ctx = make_ctx(configured, engine, config=config)
     assert sandbox._resolve_command(ctx, None, []) == ["claude", "-c"]
     assert sandbox._resolve_command(ctx, ["tmux"], []) == ["tmux"]
-    ctx.config.harness = "copilot"
+    found.add("copilot")
+    assert sandbox._resolve_command(ctx, None, []) == ["copilot"]
+    found.clear()
     assert sandbox._resolve_command(ctx, None, []) == sandbox.SHELL_FALLBACK
-    ctx.config.harness = "bash"
-    assert sandbox._resolve_command(ctx, None, []) == sandbox.SHELL_FALLBACK
-    ctx.config.harness = "'unterminated"
-    with pytest.raises(SandboxError, match="Cannot parse"):
-        sandbox._resolve_command(ctx, None, [])
+    # The user's preference comes first; duplicates of project entries are tried once.
+    found.update({"claude", "copilot"})
+    ctx.user.harness = [["missing"], ["copilot"]]
+    assert ctx.harness == [["missing"], ["copilot"], ["claude", "-c"], ["bash"]]
+    assert sandbox._resolve_command(ctx, None, []) == ["copilot"]
+    ctx.user.workspaces[str(ctx.project.root)] = {"harness": [["claude", "-c"]]}
+    assert ctx.harness == [["claude", "-c"], ["copilot"], ["bash"]]
+
+
+def test_first_installed_probe_script() -> None:
+    script = sandbox._FIRST_INSTALLED
+    run = lambda *names: subprocess.run(  # noqa: E731
+        ["sh", "-c", script, "sh", *names], capture_output=True, text=True, check=False
+    )
+    assert run("no-such-command-x", "sh", "true").stdout == "1\n"
+    assert run("no-such-command-x").returncode == 1
 
 
 def test_check_sockets(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:

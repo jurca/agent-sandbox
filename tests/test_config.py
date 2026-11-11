@@ -20,7 +20,7 @@ from agent_sandbox.util import SandboxError
 def test_minimal_project_config_gets_defaults() -> None:
     cfg = parse_project_config({"image": " ubuntu:24.04 "})
     assert cfg.image == "ubuntu:24.04"
-    assert cfg.harness == "bash"
+    assert cfg.harness == [["claude"], ["copilot"], ["bash"], ["sh"]]
     assert cfg.env_pass == list(DEFAULT_ENV_PASS)
     assert cfg.env_set == {}
     assert cfg.mounts == []
@@ -47,7 +47,7 @@ def test_full_project_config() -> None:
     )
     assert cfg.protected == [".claude", ".envrc"]
     assert cfg.isolated == ["web/node_modules"]
-    assert cfg.harness == "claude --verbose"
+    assert cfg.harness == [["claude", "--verbose"]]
     assert cfg.env_pass == ["TERM"]
     assert cfg.env_set == {"A": "{home}/x"}
     assert cfg.mounts == [MountSpec("/data", "/mnt/data"), MountSpec("/opt", "/opt", False)]
@@ -84,7 +84,11 @@ def test_full_project_config() -> None:
         ({"image": "i", "setup": {"start": [" "]}}, "must not be empty"),
         ({"image": "i", "setup": {"stop": []}}, "unknown key"),
         ({"image": "i", "colour": "red"}, "unknown key"),
-        ({"image": "i", "harness": ""}, "harness"),
+        ({"image": "i", "harness": ""}, "must not be empty"),
+        ({"image": "i", "harness": []}, "non-empty list"),
+        ({"image": "i", "harness": ["claude", 1]}, "non-empty list"),
+        ({"image": "i", "harness": ["claude", " "]}, "must not be empty"),
+        ({"image": "i", "harness": ["claude", "'unterminated"]}, "cannot parse harness"),
         ({"image": "i", "env": []}, r"\[env\] must be a table"),
         ({"image": "i", "env": {"keep": []}}, "unknown key"),
         ({"image": "i", "env": {"pass": "TERM"}}, "list of strings"),
@@ -158,6 +162,22 @@ def test_user_config_devcontainer_cli() -> None:
             parse_user_config({"devcontainer_cli": bad})
 
 
+def test_harness_list() -> None:
+    cfg = parse_project_config({"image": "i", "harness": ["claude -c", "opencode", "sh"]})
+    assert cfg.harness == [["claude", "-c"], ["opencode"], ["sh"]]
+
+
+def test_user_config_harness() -> None:
+    assert parse_user_config({}).harness_preference(Path("/w")) == []
+    cfg = parse_user_config(
+        {"harness": "copilot", "workspaces": {"/w/a": {"harness": ["claude -c", "claude"]}}}
+    )
+    assert cfg.harness_preference(Path("/w/a")) == [["claude", "-c"], ["claude"]]
+    assert cfg.harness_preference(Path("/w/b")) == [["copilot"]]
+    with pytest.raises(SandboxError, match="harness"):
+        parse_user_config({"workspaces": {"/w": {"harness": []}}})
+
+
 def test_init_template_parses_and_escapes() -> None:
     data = tomllib.loads(templates.render_config('reg/img:"tag"\\x'))
     cfg = parse_project_config(data)
@@ -165,6 +185,7 @@ def test_init_template_parses_and_escapes() -> None:
     assert cfg.env_set["CLAUDE_CONFIG_DIR"] == "{home}/.claude"
     assert cfg.state_paths == list(DEFAULT_STATE_PATHS)
     assert cfg.mounts == []
+    assert cfg.harness == [["claude"], ["copilot"], ["bash"], ["sh"]]
 
 
 def test_load_project_config(repo: Path) -> None:

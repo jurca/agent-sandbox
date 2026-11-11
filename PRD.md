@@ -127,8 +127,10 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
   setup commands put only in rc files (pipx-based Features such as poetry append to
   `/etc/bash.bashrc`, rustup to `~/.profile`) reaches non-interactive commands such as
   `sh -c "poetry sync"`. A failed probe warns and adds nothing. Root execs are not probed.
-- Default command: `harness` from config (shlex-split). If it is not installed: print an error and
-  start `bash` (or `sh`). `exec -- CMD` runs arbitrary commands (a second harness, tmux).
+- Default command: the first installed of the `harness` candidates (each shlex-split), with the
+  user config's `harness` preference tried before the project's list (duplicates once). One exec
+  probes all first words with `command -v`. If none is installed: print an error and start `bash`
+  (or `sh`). `exec -- CMD` runs arbitrary commands (a second harness, tmux).
 - `root`: `exec --user 0` with a prominent banner (setup only; do not run harnesses; root in a
   rootless engine equals the host user on the mounts, in a rootful engine it can create root/setuid
   files in the workspace). Starting a harness as root cannot be prevented, only discouraged.
@@ -179,7 +181,7 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### Project: `.agent-sandbox/` (committed)
 
 - `config.toml`: `image` or `[devcontainer] enabled`/`config` (exactly one, section 6), `harness`
-  (default `bash`), `[env] pass`/`[env.set]`,
+  (a command line or a list of them, default `["claude", "copilot", "bash", "sh"]`), `[env] pass`/`[env.set]`,
   `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`, `.devcontainer`),
   `[workspace] isolated` (default `.venv`, `node_modules`), `[workspace] secrets`,
   `secrets_except` and `secrets_history_depth` (section 8, "Secret files"), `[[mounts]]` (`source`, `target`
@@ -203,7 +205,8 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### User: `~/.config/agent-sandbox/config.toml` (never in the repo)
 
 `engine`, `docker_context`, `allow_rootful`, `git` (`ro`/`rw`), `state_volume`
-(`per-workspace` or a shared name), `[workspaces."/abs/path"]` overrides, `[proxy] base_image`,
+(`per-workspace` or a shared name), `harness` (tried before the project's list),
+`[workspaces."/abs/path"]` overrides (`git`, `state_volume`, `harness`), `[proxy] base_image`,
 `devcontainer_cli` (command list, default `["devcontainer"]`).
 Shared state volumes belong to no single workspace: `rm --state` and `prune` keep them (with a note)
 and `ls` does not list them.
