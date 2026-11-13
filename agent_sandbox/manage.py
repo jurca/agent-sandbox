@@ -40,10 +40,10 @@ from .sandbox import (
     base_ref,
     compute_spec,
     container_home,
-    fix_state_ownership,
     make_plan,
     reclaim_workspace,
     remove_by_id,
+    reset_volume_ownership,
     share_workspace,
     spec_hash,
 )
@@ -376,8 +376,9 @@ def repair(ctx: Context) -> None:
             if host_uid != os.getuid():
                 failed = share_workspace(ctx, plan, host_uid)
                 eprint(f"Re-applied workspace ACLs ({failed} path(s) could not be changed).")
-        fix_state_ownership(ctx, home)
-        eprint("Reset ownership of the harness state directories.")
+        info = engine.inspect("container", project.workspace_container) or {}
+        reset_volume_ownership(ctx, plan, str(info.get("Image", "")))
+        eprint("Reset ownership of the harness state and isolated volumes.")
     eprint("Done.")
 
 

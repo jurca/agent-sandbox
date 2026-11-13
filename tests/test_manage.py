@@ -145,7 +145,7 @@ def test_repair_reclaims_before_reapplying_acls(
     monkeypatch.setattr(
         manage, "share_workspace", lambda c, p, uid: steps.append(f"acl {uid}") or 0
     )
-    monkeypatch.setattr(manage, "fix_state_ownership", lambda c, h: steps.append("state"))
+    monkeypatch.setattr(manage, "reset_volume_ownership", lambda c, p, i: steps.append("state"))
     monkeypatch.setattr(manage, "container_home", lambda c: "/home/dev")
     manage.repair(ctx)
     assert steps == ["reclaim", "acl 100999", "state"]
@@ -159,7 +159,7 @@ def test_repair_reclaims_on_other_engines_too(repo: Path, monkeypatch: pytest.Mo
     steps: list[str] = []
     monkeypatch.setattr(manage, "reclaim_workspace", lambda c, p: steps.append("reclaim") or (0, 0))
     monkeypatch.setattr(manage, "share_workspace", lambda c, p, uid: pytest.fail("no ACLs"))
-    monkeypatch.setattr(manage, "fix_state_ownership", lambda c, h: steps.append("state"))
+    monkeypatch.setattr(manage, "reset_volume_ownership", lambda c, p, i: steps.append("state"))
     monkeypatch.setattr(manage, "container_home", lambda c: "/home/dev")
     manage.repair(ctx)
     assert steps == []  # not running: nothing to reclaim

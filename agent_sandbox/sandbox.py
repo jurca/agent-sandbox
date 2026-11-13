@@ -541,7 +541,13 @@ def reclaim_workspace(ctx: Context, plan: Plan) -> tuple[int, int]:
 
 
 def fix_state_ownership(ctx: Context, home: str) -> None:
-    """Docker creates volume mount points owned by root; hand them to the sandbox user."""
+    """Docker creates volume mount points (and their missing parents) owned by root; hand them
+    to the sandbox user.
+
+    Only for a container that was just started: nothing has run in it yet, so every path is
+    the image's or the engine's. Later the sandbox user owns the parents (`~/.cache`) and may
+    have replaced one with a symlink, so a root `chown` would follow it to any file in the
+    container; `reset_volume_ownership` is for that. `-h` all the same."""
     paths: list[str] = []
     for rel in ctx.config.state_paths:
         current = PurePosixPath(home)
@@ -556,8 +562,36 @@ def fix_state_ownership(ctx: Context, home: str) -> None:
     owner = f"{ctx.uid}:{ctx.gid}"
     ctx.engine.run(
         "exec", "--user", "0", ctx.project.workspace_container, "sh", "-c",
-        'owner=$1; shift; for p; do chown "$owner" "$p"; done', "sh", owner, *paths,
+        'owner=$1; shift; for p; do chown -h "$owner" "$p"; done', "sh", owner, *paths,
     )  # fmt: skip
+
+
+VOLUME_HELPER_DIR = "/asb-volume"
+
+
+def reset_volume_ownership(ctx: Context, plan: Plan, image: str) -> None:
+    """Hand the roots of the state and isolated volumes back to the sandbox user.
+
+    From a throwaway container that mounts nothing but the volumes: in the workspace container
+    their paths lead through directories the sandbox user controls, so it could point a root
+    `chown` there at any file (see `fix_state_ownership`). A mount point cannot be a symlink.
+    Volumes that do not exist are skipped rather than created.
+    """
+    engine = ctx.engine
+    names = [name for name, _ in [*plan.volumes, *plan.isolated] if engine.exists("volume", name)]
+    if not names:
+        return
+    args = [
+        "run", "--rm", "--pull", "never", "--user", "0", "--network", "none",
+        "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges",
+        "--entrypoint", "chown",
+    ]  # fmt: skip
+    if plan.ownership == "keep-id":
+        args.append("--userns=keep-id")
+    targets = [f"{VOLUME_HELPER_DIR}/{index}" for index in range(len(names))]
+    for name, target in zip(names, targets, strict=True):
+        args += VolumeMount(name, target).engine_args()
+    engine.run(*args, image, "-h", f"{ctx.uid}:{ctx.gid}", *targets)
 
 
 # --- attaching --------------------------------------------------------------------------

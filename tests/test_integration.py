@@ -423,6 +423,20 @@ def test_file_replaced_in_the_sandbox_stays_writable_on_the_host(env: Env, works
     target.unlink()
 
 
+def test_repair_does_not_follow_symlinks_in_the_container(env: Env, scratch: Path) -> None:
+    # The sandbox user owns ~/.cache, the parent of the pre-commit state volume, and swaps it for
+    # a symlink to a root-owned directory holding a file of the volume's name (as an image with
+    # pre-commit installed globally would). repair must reset the volume, not that file.
+    home = sh(env, scratch, "echo ~").strip()  # also creates the sandbox
+    setup = f"touch /usr/local/bin/pre-commit && chown 0:0 {home}/.cache/pre-commit"
+    engine("exec", "--user", "0", f"agent-sandbox-{make_id(scratch)}", "sh", "-c", setup,
+           check=True)  # fmt: skip
+    sh(env, scratch, "cd ~ && mv .cache .cache.moved && ln -s /usr/local/bin .cache")
+    ok(env, scratch, "repair")
+    owners = "stat -c %u /usr/local/bin /usr/local/bin/pre-commit ~/.cache.moved/pre-commit"
+    assert sh(env, scratch, owners).split() == ["0", "0", str(os.getuid())]
+
+
 def test_repair_reclaims_files_the_host_cannot_change(env: Env, workspace: Path) -> None:
     # A sandbox-owned file without the host user's ACL entry (as left by older versions or a
     # chmod), inside a directory the host cannot even read.

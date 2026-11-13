@@ -451,11 +451,44 @@ def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> 
         next(c for c in engine.calls if c[:3] == ("create", "--name", ctx.project.proxy_container))
     )
     chown = next(c for c in engine.calls if c[:3] == ("exec", "--user", "0"))
+    assert "chown -h" in " ".join(chown)
     assert chown[-6:] == (
         "/home/dev/.claude", "/home/dev/.copilot",
         "/home/dev/.cache", "/home/dev/.cache/pre-commit",
         f"{configured}/.venv", f"{configured}/node_modules",
     )  # fmt: skip
+
+
+@pytest.mark.parametrize(("kind", "keep_id"), [("docker", False), ("podman", True)])
+def test_reset_volume_ownership_uses_a_helper_container(
+    configured: Path, kind: str, keep_id: bool
+) -> None:
+    engine = FakeEngine(kind)
+    ctx = make_ctx(configured, engine)
+    plan = make_plan(ctx, "/home/dev")
+    existing = [plan.volumes[0][0], plan.volumes[1][0], plan.isolated[0][0]]
+    for name in existing:
+        engine.add("volume", name, {})
+    sandbox.reset_volume_ownership(ctx, plan, "sha256:img")
+    assert not any(call[0] == "exec" for call in engine.calls)  # never in the workspace
+    run = next(c for c in engine.calls if c[0] == "run")
+    joined = " ".join(run)
+    assert run[:2] == ("run", "--rm") and "--pull never" in joined
+    assert "--network none" in joined and "--cap-drop ALL --cap-add CHOWN" in joined
+    assert "--security-opt no-new-privileges" in joined and "--entrypoint chown" in joined
+    assert ("--userns=keep-id" in run) == keep_id
+    targets = [f"/asb-volume/{index}" for index in range(len(existing))]
+    for name, target in zip(existing, targets, strict=True):
+        assert f"type=volume,src={name},dst={target}" in joined
+    assert joined.count("type=volume") == len(existing)  # missing volumes are not created
+    assert run[-(len(targets) + 3) :] == ("sha256:img", "-h", "1000:1000", *targets)
+
+
+def test_reset_volume_ownership_without_volumes_runs_nothing(configured: Path) -> None:
+    engine = FakeEngine()
+    ctx = make_ctx(configured, engine)
+    sandbox.reset_volume_ownership(ctx, make_plan(ctx, "/home/dev"), "sha256:img")
+    assert not any(call[0] == "run" for call in engine.calls)
 
 
 def test_ensure_ready_detects_drift(configured: Path) -> None:
