@@ -265,9 +265,11 @@ def approve(env: Env, root: Path) -> None:
 
 @pytest.fixture(scope="session")
 def workspace(env: Env) -> Iterator[Path]:
-    """One long-lived sandbox shared by the non-destructive tests."""
+    """One long-lived sandbox shared by the non-destructive tests, running from the start, so
+    that each of them also works on its own (`net` and `doctor` do not create a sandbox)."""
     root = make_repo(env.base / "main")
     configure(root, env)
+    ok(env, root, "exec", "--", "true")
     yield root
     asb(env, root, "rm", "--state")
 
