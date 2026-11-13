@@ -1,7 +1,10 @@
 """End-to-end tests against a real engine (`pytest --integration`).
 
-They need rootless docker (or another engine the CLI accepts), `setfacl`, and outbound HTTPS to
-example.com. Everything lives in /tmp/asb-it-* with isolated AGENT_SANDBOX_*_DIR; finalizers run
+They need a container engine, outbound HTTPS to example.com and, for rootless docker, `setfacl`.
+A rootful engine needs AGENT_SANDBOX_ALLOW_ROOTFUL=1. Tests marked `rootless_only` or
+`rootful_only` are skipped on an engine of the other mode.
+
+Everything lives in /tmp/asb-it-* with isolated AGENT_SANDBOX_*_DIR; finalizers run
 `rm --state`. Images are never pulled: ASB_TEST_IMAGE (default: a local devcontainer image whose
 uid 1000 user exists) must be present, and the derived-image tests use the locally built
 tinyproxy image as their Alpine base. The devcontainer test only runs when
@@ -12,6 +15,7 @@ so it needs no registry.
 
 from __future__ import annotations
 
+import functools
 import getpass
 import grp
 import json
@@ -94,6 +98,19 @@ def engine(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run([ENGINE, *args], capture_output=True, text=True, check=check)
 
 
+@functools.cache
+def engine_is_rootless() -> bool:
+    return detect_engine(UserConfig(engine=ENGINE, allow_rootful=True)).rootless
+
+
+@pytest.fixture(autouse=True)
+def engine_mode(request: pytest.FixtureRequest, env: Env) -> None:
+    """Skip tests marked for the other engine mode (after `env` has skipped an unusable one)."""
+    for marker, rootless in (("rootless_only", True), ("rootful_only", False)):
+        if request.node.get_closest_marker(marker) and engine_is_rootless() != rootless:
+            pytest.skip(f"needs a {'rootless' if rootless else 'rootful'} engine")
+
+
 def has_image(ref: str) -> bool:
     return engine("image", "inspect", ref).returncode == 0
 
@@ -102,6 +119,8 @@ def has_image(ref: str) -> bool:
 def env() -> Iterator[Env]:
     if shutil.which(ENGINE) is None or engine("info").returncode != 0:
         pytest.skip(f"{ENGINE} is not usable")
+    if not engine_is_rootless() and os.environ.get("AGENT_SANDBOX_ALLOW_ROOTFUL") != "1":
+        pytest.skip(f"{ENGINE} is rootful: set AGENT_SANDBOX_ALLOW_ROOTFUL=1 to test it")
     if not has_image(IMAGE):
         pytest.skip(f"{IMAGE} is not present locally (set ASB_TEST_IMAGE)")
     base = Path(tempfile.mkdtemp(prefix="asb-it-", dir="/tmp"))
@@ -398,6 +417,7 @@ def test_status_and_doctor(env: Env, workspace: Path) -> None:
     assert "FAIL" not in doctor and "No problems found." in doctor
 
 
+@pytest.mark.rootless_only
 def test_repair_restores_acls(env: Env, workspace: Path) -> None:
     target = workspace / "acl-target"
     target.write_text("x")
@@ -411,6 +431,7 @@ def test_repair_restores_acls(env: Env, workspace: Path) -> None:
     target.unlink()
 
 
+@pytest.mark.rootless_only
 def test_file_replaced_in_the_sandbox_stays_writable_on_the_host(env: Env, workspace: Path) -> None:
     target = workspace / "replaced.txt"
     target.write_text("hello\n")
@@ -437,6 +458,7 @@ def test_repair_does_not_follow_symlinks_in_the_container(env: Env, scratch: Pat
     assert sh(env, scratch, owners).split() == ["0", "0", str(os.getuid())]
 
 
+@pytest.mark.rootless_only
 def test_repair_reclaims_files_the_host_cannot_change(env: Env, workspace: Path) -> None:
     # A sandbox-owned file without the host user's ACL entry (as left by older versions or a
     # chmod), inside a directory the host cannot even read.
@@ -475,7 +497,8 @@ def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
         config.write_text(original)
         approve(env, workspace)
     result = ok(env, workspace, "root", stdin="id -u\n")
-    assert "ROOT SHELL" in result.err and "Rootless engine" in result.err
+    mode_note = "Rootless engine" if engine_is_rootless() else "ROOTFUL engine"
+    assert "ROOT SHELL" in result.err and mode_note in result.err
     assert result.out.strip() == "0"
 
 

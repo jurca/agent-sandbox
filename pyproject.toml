@@ -25,6 +25,8 @@ packages = ["agent_sandbox"]
 testpaths = ["tests"]
 markers = [
     "integration: needs a working rootless/rootful container engine and network (run with --integration)",
+    "rootless_only: integration test skipped on a rootful engine",
+    "rootful_only: integration test skipped on a rootless engine",
 ]
 
 [tool.ruff]
