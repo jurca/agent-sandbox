@@ -39,6 +39,7 @@ def test_full_project_config() -> None:
             "mounts": [
                 {"source": "/data/", "target": "/mnt/data"},
                 {"source": "/opt", "check_secrets": False},
+                {"source": "/nfs", "check_sockets": False},
             ],
             "state": {"paths": [".claude", ".config/foo"]},
             "workspace": {"protected": [".claude/", "./.envrc"], "isolated": ["web/node_modules"]},
@@ -50,7 +51,11 @@ def test_full_project_config() -> None:
     assert cfg.harness == [["claude", "--verbose"]]
     assert cfg.env_pass == ["TERM"]
     assert cfg.env_set == {"A": "{home}/x"}
-    assert cfg.mounts == [MountSpec("/data", "/mnt/data"), MountSpec("/opt", "/opt", False)]
+    assert cfg.mounts == [
+        MountSpec("/data", "/mnt/data"),
+        MountSpec("/opt", "/opt", check_secrets=False),
+        MountSpec("/nfs", "/nfs", check_sockets=False),
+    ]
     assert cfg.state_paths == [".claude", ".config/foo"]
     assert cfg.proxy_base_image == "mirror/alpine:3"
 
@@ -99,6 +104,7 @@ def test_full_project_config() -> None:
         ({"image": "i", "mounts": ["/a"]}, "must be a table"),
         ({"image": "i", "mounts": [{"source": "/a", "mode": "rw"}]}, "unknown key"),
         ({"image": "i", "mounts": [{"source": "/a", "check_secrets": "no"}]}, "true or false"),
+        ({"image": "i", "mounts": [{"source": "/a", "check_sockets": 0}]}, "check_sockets must"),
         ({"image": "i", "mounts": [{"target": "/a"}]}, "string `source`"),
         ({"image": "i", "mounts": [{"source": "rel"}]}, "absolute"),
         ({"image": "i", "mounts": [{"source": "{home}/x"}]}, "source must be absolute"),

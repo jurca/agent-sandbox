@@ -283,16 +283,21 @@ def check_sockets(ctx: Context, plan: Plan, *, unsafe: bool) -> None:
     targets += [
         (f"mount {m.target}", Path(m.source))
         for m in plan.mounts
-        if not Path(m.source).is_relative_to(ctx.project.root)
+        if m.scan_sockets and not Path(m.source).is_relative_to(ctx.project.root)
     ]
     found: list[tuple[str, Path]] = []
     for label, path in targets:
         result = scan_for_sockets(path)
         found += [(label, sock) for sock in result.sockets]
         if not result.complete:
+            hint = (
+                ""
+                if path == ctx.project.root
+                else (" For a [[mounts]] entry, `check_sockets = false` skips the scan.")
+            )
             eprint(
                 f"note: scanning {label} for unix sockets stopped early after "
-                f"{result.entries} entries; sockets deeper in the tree were not checked."
+                f"{result.entries} entries; sockets deeper in the tree were not checked.{hint}"
             )
     if not found:
         return

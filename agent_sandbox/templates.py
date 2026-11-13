@@ -53,11 +53,13 @@ paths = [".claude", ".copilot", ".cache/pre-commit"]
 # target = "~/.config/pypoetry"
 # [[mounts]]
 # source = "~/.agents/skills"
-# Real secret files (see [workspace] secrets) in a mount stop the sandbox from starting. The
-# check reads at most 50000 entries; turn it off for a mount that cannot hold any:
+# Real secret files (see [workspace] secrets) and unix sockets in a mount stop the sandbox
+# from starting. Each check reads at most 50000 entries; turn them off for a mount that cannot
+# hold any (or that is too slow or flaky to walk, such as a network file system):
 # [[mounts]]
 # source = "/data/datasets"
 # check_secrets = false
+# check_sockets = false
 
 # [proxy]
 # base_image = "docker.ops.corp.example/upstream/alpine:3"

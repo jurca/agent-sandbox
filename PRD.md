@@ -487,7 +487,8 @@ creation rolls back what it created on failure; at most one network session per 
   dirs) are scanned (budget: 50k entries / 5 s, a
   notice if incomplete) for unix sockets. Found sockets abort unless
   `--unsafely-mount-dirs-with-sockets` is given, in which case a warning is printed and the user must
-  type `I understand the risks`.
+  type `I understand the risks`. `check_sockets = false` on a `[[mounts]]` entry skips the scan of
+  that mount (walking a flaky network file system can hang or fail).
 - SELinux + podman: `relabel=shared` on the workspace mount.
 
 ### Secret files

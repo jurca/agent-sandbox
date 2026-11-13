@@ -25,6 +25,8 @@ class BindMount:
     source: str
     target: str
     readonly: bool = True
+    # False skips the unix socket scan of the source (a `check_sockets = false` extra mount).
+    scan_sockets: bool = True
 
     def engine_args(self, *, relabel: bool = False) -> list[str]:
         for part in (self.source, self.target):
@@ -99,7 +101,9 @@ def validate_extra_mounts(
             raise SandboxError(f"Mount target {target} is inside the workspace {root}; refusing.")
         if target in root.parents:
             raise SandboxError(f"Mount target {target} would cover the workspace {root}; refusing.")
-        mounts.append(BindMount(str(resolved), str(target), readonly=True))
+        mounts.append(
+            BindMount(str(resolved), str(target), readonly=True, scan_sockets=spec.check_sockets)
+        )
     return mounts
 
 

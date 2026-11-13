@@ -123,7 +123,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
                    also search this many newest commits when creating the sandbox (default: off)
   [[mounts]]       extra read-only bind mounts: source, target (default: source); `~` is
                    your home in source and the container home in target; check_secrets = false
-                   skips the (bounded) secret file check of the mount
+                   and check_sockets = false skip the (bounded) secret file and unix socket
+                   checks of the mount
   [state] paths    directories under the container home kept in a volume
                    (per workspace by default; default: .claude .copilot .cache/pre-commit)
   [proxy] base_image   image tinyproxy is installed on (default: alpine:3)
@@ -266,6 +267,7 @@ SECURITY NOTES
   `agent-sandbox repair`: it gives sandbox-owned files back to you and re-applies the ACLs.
 - Directories you mount may not contain unix sockets: a read-only mount still lets the
   sandbox connect to them. Override with the long flag only if you know what they are.
+  `check_sockets = false` on a [[mounts]] entry skips the check for that mount.
 """
 
 

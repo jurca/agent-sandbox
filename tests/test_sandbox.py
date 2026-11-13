@@ -372,6 +372,29 @@ def test_check_sockets(configured: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         sock.close()
 
 
+def test_check_sockets_skips_mount_with_check_sockets_false(
+    configured: Path, tmp_path: Path
+) -> None:
+    mounted = tmp_path / "mounted"
+    mounted.mkdir()
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(mounted / "y.sock"))
+    try:
+        for check, raises in ((True, True), (False, False)):
+            config = ProjectConfig(
+                image=IMAGE, mounts=[MountSpec(str(mounted), "/m", check_sockets=check)]
+            )
+            ctx = make_ctx(configured, config=config)
+            plan = make_plan(ctx)
+            if raises:
+                with pytest.raises(SandboxError, match=r"mount /m: .*y\.sock"):
+                    sandbox.check_sockets(ctx, plan, unsafe=False)
+            else:
+                sandbox.check_sockets(ctx, plan, unsafe=False)
+    finally:
+        sock.close()
+
+
 def fake_image(home: str = "/home/dev") -> UserImage:
     return UserImage(IMAGE, "sha256:img", "sha256:base", "dev", 1000, 1000, home, False,
                      ((0, 1000, 1), (1, 100000, 65536)))  # fmt: skip
