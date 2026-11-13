@@ -237,11 +237,15 @@ def rotated_commits(project_id: str) -> dict[str, set[str]]:
 
 
 def _commits_touching(root: Path, relative: str) -> set[str]:
-    """Every commit on any ref that adds or changes this path; deleting a file exposes nothing."""
+    """Every commit on any ref that adds or changes this path; deleting a file exposes nothing.
+
+    Every status but D is listed instead of `--diff-filter=d`: git 2.43 (Ubuntu 24.04) matches
+    no commit with an exclusion-only filter unless a diff output format is requested."""
     result = host_git(
         root,
         "-c", "log.showRoot=true",
-        "log", "--all", "--full-history", "--no-renames", "--diff-filter=d", "--format=%H",
+        "log", "--all", "--full-history", "--no-renames", "--diff-filter=ACMRTUXB",
+        "--format=%H",
         "--", f":(literal){relative}",
     )  # fmt: skip
     if result.returncode != 0:
