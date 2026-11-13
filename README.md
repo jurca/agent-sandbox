@@ -53,3 +53,7 @@ uv run pytest --integration    # also end-to-end tests against the local engine
 
 The integration tests' requirements (a local base image, outbound HTTPS) are listed at the top
 of `tests/test_integration.py`.
+
+## License
+
+GNU General Public License v3.0 or later (`GPL-3.0-or-later`); see [LICENSE](LICENSE).
