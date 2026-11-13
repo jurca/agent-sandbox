@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -102,3 +104,37 @@ def test_require_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     with pytest.raises(SandboxError, match="Not confirmed"):
         util.require_phrase("I understand the risks")
+
+
+def test_exclusive_lock_records_holder_pid(tmp_path: Path) -> None:
+    path = tmp_path / "sub" / "x.lock"
+    with util.exclusive_lock(path, "test lock"):
+        assert path.read_text() == f"{os.getpid()}\n"
+    assert path.read_text() == ""
+
+
+def test_exclusive_lock_reports_holder_when_taken(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "x.lock"
+    ready, release = os.pipe(), os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: hold the lock until told to let go
+        with util.exclusive_lock(path, "test lock"):
+            os.write(ready[1], b"x")
+            os.read(release[0], 1)
+        os._exit(0)
+    os.read(ready[0], 1)
+    timer = threading.Timer(0.2, os.write, (release[1], b"x"))
+    timer.start()
+    with util.exclusive_lock(path, "test lock"):
+        assert path.read_text() == f"{os.getpid()}\n"
+    os.waitpid(pid, 0)
+    err = capsys.readouterr().err
+    assert f"Waiting for another agent-sandbox process (PID {pid}) holding the test lock" in err
+
+
+def test_lock_holder_without_pid(tmp_path: Path) -> None:
+    path = tmp_path / "x.lock"
+    path.write_text("")
+    assert util._lock_holder(path) == "another agent-sandbox process"

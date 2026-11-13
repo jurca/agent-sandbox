@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import getpass
 import grp
 import hashlib
@@ -59,7 +58,7 @@ from .project import (
     git_layout,
 )
 from .proxy import PROXY_ALIAS, PROXY_PORT, PROXY_UID
-from .util import SandboxError, eprint, require_phrase, runtime_dir, state_dir
+from .util import SandboxError, eprint, exclusive_lock, require_phrase, runtime_dir, state_dir
 
 SPEC_VERSION = 2
 # Engines keep the writable layer across stop/start; a tmpfs gives every start an empty /tmp.
@@ -129,13 +128,8 @@ def build_context(project: Project, engine: Engine | None = None) -> Context:
 @contextlib.contextmanager
 def project_lock(project: Project) -> Generator[None]:
     path = runtime_dir() / f"{project.id}.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with exclusive_lock(path, "project lock"):
+        yield
 
 
 # --- desired state ----------------------------------------------------------------------

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import sys
+from collections.abc import Generator
 from pathlib import Path
 
 
@@ -65,6 +68,45 @@ def runtime_dir() -> Path:
     if base := os.environ.get("XDG_RUNTIME_DIR"):
         return Path(base) / "agent-sandbox"
     return Path(f"/tmp/agent-sandbox-{os.getuid()}")
+
+
+def _lock_holder(path: Path) -> str:
+    """Describe whoever holds `path`, from the PID it wrote into the lock file."""
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return "another agent-sandbox process"
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return f"another agent-sandbox process (PID {pid})"
+    state = stat.rpartition(")")[2].split()[0]
+    if state == "D":
+        return (
+            f"another agent-sandbox process (PID {pid}, stuck in I/O wait - likely a hung "
+            f"filesystem; if it does not recover, stop it with `kill -9 {pid}`)"
+        )
+    return f"another agent-sandbox process (PID {pid})"
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path, what: str) -> Generator[None]:
+    """flock `path`; if it is taken, say who holds it before waiting rather than freeze silently."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            eprint(f"Waiting for {_lock_holder(path)} holding the {what} ...")
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.truncate(0)
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            handle.truncate(0)
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 _DURATION = re.compile(r"(\d+)|((?:\d+[smh])+)")

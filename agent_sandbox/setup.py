@@ -13,7 +13,6 @@ object runs its named commands in parallel.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import subprocess
@@ -32,7 +31,16 @@ from .sandbox import (
     substitution,
     user_exec_env,
 )
-from .util import SandboxError, atomic_write, confirm, eprint, is_tty, runtime_dir, state_dir
+from .util import (
+    SandboxError,
+    atomic_write,
+    confirm,
+    eprint,
+    exclusive_lock,
+    is_tty,
+    runtime_dir,
+    state_dir,
+)
 
 CONFIG_ORIGIN = "config.toml"
 
@@ -97,13 +105,8 @@ def create_done(ctx: Context, current: Session, plan: Plan) -> bool:
 def setup_lock(ctx: Context) -> Generator[None]:
     """One setup at a time per workspace (a second `agent-sandbox` waits, then sees the record)."""
     path = runtime_dir() / f"{ctx.project.id}.setup.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with exclusive_lock(path, "setup lock"):
+        yield
 
 
 # --- running commands -------------------------------------------------------------------
