@@ -303,6 +303,13 @@ def _install_signal_handlers() -> None:
         signal.signal(sig, handler)
 
 
+SESSION_ENDINGS = {
+    "expired": "Network session expired.",
+    "stopped": "Network session stopped from another terminal.",
+    "interrupted": "Network session ended early.",
+}
+
+
 def _watch(
     ctx: Context, entries: list[str], session: NetSession, *, total: float, since: float
 ) -> int:
@@ -317,12 +324,16 @@ def _watch(
     eprint(f"Network access is on ({mode}). Press Ctrl-C to end it early.")
     last_plain = 0.0
     tick = 0
-    interrupted = False
+    # A cleared deadline means `net --stop` (or a restart of the sandbox) in another terminal.
+    ending = "expired"
     try:
         while True:
             deadline = proxyctl.read_deadline(project)
-            remaining = (deadline or 0) - time.time()
-            if deadline is None or remaining <= 0:
+            if deadline is None:
+                ending = "stopped"
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 break
             for event in log.poll():
                 message = observed.add(event)
@@ -340,7 +351,7 @@ def _watch(
             tick += 1
             time.sleep(0.5)
     except KeyboardInterrupt:
-        interrupted = True
+        ending = "interrupted"
     finally:
         if tty:
             sys.stderr.write("\r\x1b[K")
@@ -351,10 +362,10 @@ def _watch(
         for event in log.poll():
             observed.add(event)
         log.close()
-    eprint("Network session ended early." if interrupted else "Network session expired.")
+    eprint(SESSION_ENDINGS[ending])
     eprint("The proxy is back on the base allowlist.")
     offer_promotion(ctx, observed)
-    return 130 if interrupted else 0
+    return 130 if ending == "interrupted" else 0
 
 
 def offer_promotion(ctx: Context, observed: Observed) -> None:

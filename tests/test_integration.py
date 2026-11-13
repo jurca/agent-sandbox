@@ -603,7 +603,7 @@ def test_net_refuses_second_session_extends_and_stops(env: Env, workspace: Path)
         output, _ = proc.communicate(timeout=15)
     finally:
         proc.kill()
-    assert "back on the base allowlist" in output
+    assert "stopped from another terminal" in output and "back on the base allowlist" in output
     assert proxy_state(env, workspace) == "base"
     assert probe(env, workspace, "example.org:443") == {"example.org:443": "403"}
 

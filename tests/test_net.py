@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,53 @@ def test_extend_with_live_owner_only_moves_deadline(
     assert "Allow 172.30.0.0/16" in engine.files[(proxy_name, "/var/lib/asb/net.conf")]
     # configurations first, then the deadline that activates them
     assert [names for _, names in engine.copies[-2:]] == [["net.filter", "net.conf"], ["deadline"]]
+
+
+class _QuietLog:
+    def __init__(self, process: object) -> None:
+        pass
+
+    def poll(self) -> list[LogEvent]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("deadline", "interrupt", "message", "code"),
+    [
+        (lambda: time.time() - 1, False, "Network session expired.", 0),
+        (lambda: None, False, "Network session stopped from another terminal.", 0),
+        (lambda: time.time() + 100, True, "Network session ended early.", 130),
+    ],
+)
+def test_watch_tells_how_the_session_ended(
+    configured: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    deadline: Callable[[], float | None],
+    interrupt: bool,
+    message: str,
+    code: int,
+) -> None:
+    ctx = running_ctx(configured)
+
+    interrupts = [KeyboardInterrupt()] if interrupt else []
+
+    def sleep(seconds: float) -> None:  # Ctrl-C arrives once, during the countdown
+        if interrupts:
+            raise interrupts.pop()
+
+    monkeypatch.setattr(net, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(net, "LogTail", _QuietLog)
+    monkeypatch.setattr(proxyctl, "follow_log", lambda engine, project, since: None)
+    monkeypatch.setattr(proxyctl, "read_deadline", lambda project: deadline())
+    monkeypatch.setattr(proxyctl, "wait_for_state", lambda engine, project, wanted: True)
+    monkeypatch.setattr(net, "offer_promotion", lambda ctx, observed: None)
+    monkeypatch.setattr(time, "sleep", sleep)
+    assert net._watch(ctx, [], net.NetSession(), total=100, since=time.time()) == code
+    assert message in capsys.readouterr().err
 
 
 def test_stop_net(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
