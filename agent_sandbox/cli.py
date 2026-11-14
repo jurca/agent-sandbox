@@ -360,6 +360,7 @@ def _default(argv: list[str]) -> int:
                 )
             manage.init_project(project, args.image)
             eprint(f"Created {PROJECT_DIR}/ using image {args.image}.")
+            manage.offer_ignore_rules(project)
     else:
         if args.url or args.image:
             raise SandboxError(
@@ -484,6 +485,7 @@ def _dispatch(argv: list[str]) -> int:
         written = manage.init_project(project, args.image, force=args.force)
         for path in written:
             print(f"wrote {path.relative_to(project.root)}")
+        manage.offer_ignore_rules(project)
         print("Review allow.base, then run `agent-sandbox`.")
         return 0
     if cmd in ("exec", "root"):

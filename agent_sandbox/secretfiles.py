@@ -176,6 +176,25 @@ def _probes(config: ProjectConfig) -> dict[str, str]:
     return probes
 
 
+def missing_ignore_rules(root: Path, config: ProjectConfig) -> list[str]:
+    """The secret file patterns no `.gitignore` in the repository ignores yet, in config order.
+
+    A rule in an uncommitted `.gitignore` counts (committing it is the fix, not another rule);
+    one in a global or `.git/info/exclude` file does not, since clones do not get it. Git errors
+    give an empty list: the checks at start report them.
+    """
+    probes = _probes(config)
+    rules, error = _ignore_rules(root, list(probes))
+    if error:
+        return []
+    missing: list[str] = []
+    for path, pattern in probes.items():
+        source, rule = rules.get(path, ("", ""))
+        if (not _clone_safe(source) or rule.startswith("!")) and pattern not in missing:
+            missing.append(pattern)
+    return missing
+
+
 def _rule_fix(pattern: str) -> str:
     return f"add `{pattern}` to a .gitignore and commit it, so that clones get the rule too"
 

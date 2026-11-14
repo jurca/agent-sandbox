@@ -11,13 +11,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import approval, proxyctl, setup, templates
+from . import approval, proxyctl, secretfiles, setup, templates
 from .config import (
     ALLOW_BASE_FILE,
     ALLOW_EXTRA_FILE,
     CONFIG_FILE,
     PROJECT_DIR,
     PROXY_CONF_FILE,
+    load_project_config,
     load_user_config,
 )
 from .engine import Engine, probe_engines
@@ -72,6 +73,34 @@ def init_project(project: Project, image: str, *, force: bool = False) -> list[P
         written.append(target / name)
     approval.record(project)
     return written
+
+
+IGNORE_COMMENT = (
+    "# Secret files: agent-sandbox keeps them out of the sandbox (see its `help security`)"
+)
+
+
+def offer_ignore_rules(project: Project) -> None:
+    """Offer to add the secret file patterns no `.gitignore` covers to the root one (default
+    no; outside a terminal, only say so). Nothing is committed: that stays the user's step."""
+    missing = secretfiles.missing_ignore_rules(project.root, load_project_config(project.root))
+    if not missing:
+        return
+    listing = ", ".join(f"`{pattern}`" for pattern in missing)
+    eprint(
+        f"Secret files ({listing}) are not ignored by git. The sandbox does not start until a "
+        "committed .gitignore ignores them."
+    )
+    if not is_tty() or not confirm(f"Add {listing} to .gitignore?"):
+        eprint("Add them to a .gitignore and commit it.")
+        return
+    gitignore = project.root / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    # A blank line after existing rules (completing an unterminated last line first).
+    separator = "" if not existing.strip() else "\n" if existing.endswith("\n") else "\n\n"
+    with gitignore.open("a") as handle:
+        handle.write(separator + "\n".join([IGNORE_COMMENT, *missing]) + "\n")
+    eprint("Added them to .gitignore; commit it together with .agent-sandbox/.")
 
 
 def clone_repository(url: str, dest: str | None) -> Path:

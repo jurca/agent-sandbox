@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from agent_sandbox import approval, manage
+from agent_sandbox.config import ProjectConfig
 from agent_sandbox.project import LABEL_ROLE, LABEL_STATE_SCOPE, make_id, project_for
 from agent_sandbox.util import SandboxError
 
@@ -228,3 +230,55 @@ def test_container_privileges(host: dict[str, object], ok: bool, fragment: str) 
 )
 def test_lsm_confinement(label: str, modules: set[str], rootless: bool, level: str) -> None:
     assert manage.lsm_confinement(label, modules, rootless=rootless)[0] == level
+
+
+def _without_secret_rules(repo: Path, text: str = "build/") -> Path:
+    (repo / ".gitignore").write_text(text)  # no trailing newline on purpose
+    manage.init_project(project_for(repo), "img:1")
+    return repo
+
+
+def test_offer_ignore_rules_outside_a_terminal_only_tells(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _without_secret_rules(repo)
+    monkeypatch.setattr(manage, "is_tty", lambda: False)
+    manage.offer_ignore_rules(project_for(repo))
+    err = capsys.readouterr().err
+    assert "Secret files (`.env`, `.env.*`, `*.env`) are not ignored by git" in err
+    assert "Add them to a .gitignore and commit it." in err
+    assert (repo / ".gitignore").read_text() == "build/"
+
+
+@pytest.mark.parametrize("answer", [False, True])
+def test_offer_ignore_rules_asks_and_appends(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, answer: bool
+) -> None:
+    _without_secret_rules(repo)
+    questions: list[str] = []
+    monkeypatch.setattr(manage, "is_tty", lambda: True)
+    monkeypatch.setattr(
+        manage, "confirm", lambda question, **kw: questions.append(question) or answer
+    )
+    manage.offer_ignore_rules(project_for(repo))
+    assert questions == ["Add `.env`, `.env.*`, `*.env` to .gitignore?"]
+    text = (repo / ".gitignore").read_text()
+    if not answer:
+        assert text == "build/"
+        return
+    assert text == f"build/\n\n{manage.IGNORE_COMMENT}\n.env\n.env.*\n*.env\n"
+    assert manage.secretfiles.missing_ignore_rules(repo, ProjectConfig()) == []
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", ".gitignore"],
+        capture_output=True, text=True, check=True,
+    ).stdout  # fmt: skip
+    assert status.startswith(" M")  # changed, not committed
+
+
+def test_offer_ignore_rules_is_quiet_when_covered(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manage.init_project(project_for(repo), "img:1")  # make_repo commits the rules
+    monkeypatch.setattr(manage, "confirm", lambda *a, **k: pytest.fail("asked"))
+    manage.offer_ignore_rules(project_for(repo))
+    assert capsys.readouterr().err == ""

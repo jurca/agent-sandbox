@@ -552,3 +552,28 @@ def test_project_settings_add_to_the_defaults(repo: Path) -> None:
 def test_invalid_settings(repo: Path, setting: str) -> None:
     with pytest.raises(SandboxError):
         load(repo, setting)
+
+
+@pytest.mark.parametrize(
+    ("gitignore", "exclude", "expected"),
+    [
+        (".env\n.env.*\n*.env\n", "", []),  # what make_repo commits
+        ("", "", [".env", ".env.*", "*.env"]),
+        (".env\n", "", [".env.*", "*.env"]),
+        ("*.env\n!.env\n", "", [".env", ".env.*"]),  # `.env.*` is not matched by `*.env`
+        ("/.env\n.env.*\n", "", [".env", "*.env"]),  # anchored: misses `.env` one level down
+        ("", ".env\n.env.*\n*.env\n", [".env", ".env.*", "*.env"]),  # clones do not get it
+    ],
+)
+def test_missing_ignore_rules(
+    repo: Path, gitignore: str, exclude: str, expected: list[str]
+) -> None:
+    (repo / ".gitignore").write_text(gitignore)
+    (repo / ".git" / "info" / "exclude").write_text(exclude)
+    assert secretfiles.missing_ignore_rules(repo, ProjectConfig()) == expected
+
+
+def test_missing_ignore_rules_counts_an_uncommitted_gitignore(repo: Path) -> None:
+    git(repo, "rm", "-q", "--cached", ".gitignore")
+    assert secretfiles.missing_ignore_rules(repo, ProjectConfig()) == []
+    assert run_check(repo)  # the check at start still asks for a committed one
