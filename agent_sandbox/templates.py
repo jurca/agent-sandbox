@@ -101,7 +101,10 @@ downloads.claude.ai
 github.com
 api.github.com
 .githubcopilot.com
+gh.io
 # Optional:
+#   raw.githubusercontent.com                 copilot installation
+#   release-assets.githubusercontent.com      copilot updates
 #   copilot-proxy.githubusercontent.com
 #   origin-tracker.githubusercontent.com
 #   copilot-telemetry.githubusercontent.com
