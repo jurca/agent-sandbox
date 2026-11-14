@@ -166,3 +166,65 @@ def test_repair_reclaims_on_other_engines_too(repo: Path, monkeypatch: pytest.Mo
     engine.add("container", ctx.project.workspace_container, {}, State={"Status": "running"})
     manage.repair(ctx)
     assert steps == ["reclaim", "state"]
+
+
+CONFINED = {"Seccomp": "2", "NoNewPrivs": "1", "CapEff": "0000000000000000"}
+
+
+def test_parse_proc_status() -> None:
+    text = (
+        "CapEff:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n"
+        "Label:\tdocker-default (enforce)\0\n"
+    )
+    assert manage.parse_proc_status(text) == {**CONFINED, "Label": "docker-default (enforce)"}
+
+
+@pytest.mark.parametrize(
+    ("change", "ok", "fragment"),
+    [
+        ({}, True, "seccomp filter, no-new-privileges, no capabilities"),
+        ({"Seccomp": "0"}, False, "seccomp is off (mode 0)"),
+        ({"NoNewPrivs": "0"}, False, "no-new-privileges is not set"),
+        ({"CapEff": "00000000a80425fb"}, False, "has capabilities (00000000a80425fb)"),
+    ],
+)
+def test_process_confinement(change: dict[str, str], ok: bool, fragment: str) -> None:
+    result = manage.process_confinement("the sandbox user", {**CONFINED, **change})
+    assert result[0] == ok and fragment in result[1]
+
+
+def test_process_confinement_without_output_fails() -> None:
+    ok, text = manage.process_confinement("the proxy", {})
+    assert not ok and "seccomp is off (mode ?)" in text and "has capabilities (?)" in text
+
+
+@pytest.mark.parametrize(
+    ("host", "ok", "fragment"),
+    [
+        ({"Privileged": False, "CapAdd": None}, True, "not privileged"),
+        ({"Privileged": True}, False, "is privileged"),
+        ({"CapAdd": ["SYS_ADMIN", "NET_ADMIN"]}, False, "capabilities: SYS_ADMIN, NET_ADMIN"),
+    ],
+)
+def test_container_privileges(host: dict[str, object], ok: bool, fragment: str) -> None:
+    result = manage.container_privileges({"HostConfig": host})
+    assert result[0] == ok and fragment in result[1]
+
+
+@pytest.mark.parametrize(
+    ("label", "modules", "rootless", "level"),
+    [
+        ("docker-default (enforce)", {"apparmor"}, False, "ok"),
+        ("system_u:system_r:container_t:s0:c1,c2", {"selinux"}, True, "ok"),
+        ("kernel", set(), False, "warn"),
+        ("runc (unconfined)", set(), True, "warn"),  # rootless docker, Ubuntu 24.04 host
+        ("", set(), True, "warn"),
+        ("unconfined", {"apparmor"}, True, "warn"),
+        ("unconfined", {"apparmor"}, False, "FAIL"),
+        ("docker-default (complain)", {"apparmor"}, False, "FAIL"),
+        ("system_u:system_r:spc_t:s0", {"selinux"}, False, "FAIL"),
+        ("unconfined_u:unconfined_r:unconfined_t:s0", {"selinux"}, False, "FAIL"),
+    ],
+)
+def test_lsm_confinement(label: str, modules: set[str], rootless: bool, level: str) -> None:
+    assert manage.lsm_confinement(label, modules, rootless=rootless)[0] == level

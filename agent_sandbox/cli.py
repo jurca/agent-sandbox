@@ -236,8 +236,10 @@ https:// proxy URL is not supported; ports and IPv6 in NO_PROXY are ignored with
 HELP_SECURITY = """\
 SECURITY NOTES
 
-- The container is the boundary: default seccomp/AppArmor, no-new-privileges, no sudo, a
-  non-root user. Only the workspace, harness state volumes and your extra mounts are shared.
+- The container is the boundary: the engine's default seccomp profile, its AppArmor or SELinux
+  confinement where the host has one, no-new-privileges, no sudo, a non-root user without
+  capabilities. Only the workspace, harness state volumes and your extra mounts are shared.
+  `agent-sandbox doctor` checks what the running sandbox actually gets.
 - Disable the harness's own sandbox (Claude Code's bubblewrap sandbox, VS Code's
   chat.agent.sandbox): it cannot start inside the container, which already isolates more.
 - The proxy container runs as `nobody` with no capabilities and no host mounts; its

@@ -275,6 +275,77 @@ echo "sockets_end"
 """
 
 
+# The process's confinement as /proc reports it (the exec gets the container's settings), and
+# its LSM label: AppArmor's own file on newer kernels, else the shared one ("kernel" when no
+# LSM is loaded).
+_SECURITY_SCRIPT = r"""
+grep -E '^(Seccomp|NoNewPrivs|CapEff):' /proc/self/status
+label=$(cat /proc/self/attr/apparmor/current 2>/dev/null || cat /proc/self/attr/current 2>/dev/null)
+printf 'Label:\t%s\n' "$label"
+"""
+
+
+def parse_proc_status(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip()] = value.strip().rstrip("\0")
+    return fields
+
+
+def process_confinement(who: str, status: dict[str, str]) -> tuple[bool, str]:
+    """(ok, text) for seccomp, no-new-privileges and effective capabilities."""
+    problems = []
+    if status.get("Seccomp") != "2":
+        problems.append(f"seccomp is off (mode {status.get('Seccomp', '?')})")
+    if status.get("NoNewPrivs") != "1":
+        problems.append("no-new-privileges is not set")
+    caps = status.get("CapEff", "?")
+    if caps == "?" or caps.strip("0"):
+        problems.append(f"has capabilities ({caps})")
+    if problems:
+        return False, f"{who}: " + ", ".join(problems)
+    return True, f"{who}: seccomp filter, no-new-privileges, no capabilities"
+
+
+def container_privileges(info: dict[str, object]) -> tuple[bool, str]:
+    host = info.get("HostConfig")
+    host = host if isinstance(host, dict) else {}
+    added = host.get("CapAdd") or []
+    if host.get("Privileged") or added:
+        extra = ", ".join(str(cap) for cap in added) if isinstance(added, list) else str(added)
+        return False, (
+            "the sandbox container is "
+            + ("privileged" if host.get("Privileged") else f"given capabilities: {extra}")
+        )
+    return True, "the sandbox container is not privileged and is given no capabilities"
+
+
+LSM_NAMES = {"apparmor": "AppArmor", "selinux": "SELinux"}
+
+
+def lsm_confinement(label: str, modules: set[str], *, rootless: bool) -> tuple[str, str]:
+    """(level, text), level "ok", "warn" or "FAIL", for the sandbox's AppArmor/SELinux label."""
+    if label.endswith("(enforce)"):
+        return "ok", f"confined by AppArmor ({label})"
+    if ":" in label and "unconfined" not in label and ":spc_t:" not in label:
+        return "ok", f"confined by SELinux ({label})"
+    seen = label or "none"
+    if not modules:  # also rootless docker on an AppArmor host: label "runc (unconfined)"
+        return "warn", (
+            "the engine applies no AppArmor or SELinux profile, so the sandbox is confined by "
+            f"seccomp, capabilities and namespaces only (label: {seen})"
+        )
+    available = " and ".join(LSM_NAMES.get(module, module) for module in sorted(modules))
+    if rootless:
+        return "warn", (
+            f"the engine has {available}, but this rootless sandbox is not confined by it "
+            f"(label: {seen})"
+        )
+    return "FAIL", f"the engine has {available}, but the sandbox is not confined by it ({seen})"
+
+
 def doctor(ctx: Context) -> int:
     engine, project = ctx.engine, ctx.project
     problems = 0
@@ -307,6 +378,20 @@ def doctor(ctx: Context) -> int:
                     f"workspace ACL grants host uid {host_uid} (the sandbox user) and you access"
                     " (if not: `agent-sandbox repair`)",
                 )
+    workspace = engine.run(
+        "exec", "--user", f"{ctx.uid}:{ctx.gid}", project.workspace_container,
+        "sh", "-c", _SECURITY_SCRIPT,
+        check=False,
+    )  # fmt: skip
+    status = parse_proc_status(workspace.stdout)
+    report(*process_confinement("the sandbox user", status))
+    report(*container_privileges(engine.inspect("container", project.workspace_container) or {}))
+    level, text = lsm_confinement(
+        status.get("Label", ""), engine.security_modules(), rootless=engine.rootless
+    )
+    report(level == "ok", text, warn=level == "warn")
+    proxy = engine.run("exec", project.proxy_container, "sh", "-c", _SECURITY_SCRIPT, check=False)
+    report(*process_confinement("the proxy", parse_proc_status(proxy.stdout)))
     proxy_uid = engine.run("exec", project.proxy_container, "id", "-u", check=False).stdout.strip()
     proxy_mounts = (engine.inspect("container", project.proxy_container) or {}).get("Mounts")
     report(

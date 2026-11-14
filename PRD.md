@@ -88,7 +88,9 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
   works on Alpine; shell is bash when present). Existing user with that uid is accepted whatever its
   name. Derived image carries the base image id as a label and is rebuilt when it changes.
 - Host umask applied through `sh -c 'umask ...; exec "$@"'` on every exec.
-- Hardening: default seccomp/AppArmor, `no-new-privileges`, default capabilities (so `root` can
+- Hardening: default seccomp, AppArmor/SELinux where the engine's host has one (`doctor`
+  checks seccomp, no-new-privileges, capabilities and the label from inside the container),
+  `no-new-privileges`, default capabilities (so `root` can
   `apt`), `--init`, no memory limit, no restart policy.
 - Mounts (every workspace path keeps its host path inside, and the working directory of the
   container and of every exec is the workspace root):

@@ -129,6 +129,31 @@ class Engine:
             raise EngineError(f"Image {ref} is not available after pulling.")
         return image_id
 
+    def security_modules(self) -> set[str]:
+        """The Linux security modules ("apparmor", "selinux") the engine can confine with, as
+        it reports them (so a remote docker context reports its own host)."""
+        if self.kind == "docker":
+            result = self.run("info", "--format", "{{json .SecurityOptions}}", check=False)
+            options = _json_or(result.stdout if result.returncode == 0 else "", [])
+            if not isinstance(options, list):
+                options = []
+            names = {
+                part.removeprefix("name=")
+                for option in options if isinstance(option, str)
+                for part in option.split(",") if part.startswith("name=")
+            }  # fmt: skip
+        else:
+            result = self.run("info", "--format", "{{json .Host.Security}}", check=False)
+            security = _json_or(result.stdout if result.returncode == 0 else "", {})
+            if not isinstance(security, dict):
+                security = {}
+            names = {
+                name
+                for name, key in (("apparmor", "apparmorEnabled"), ("selinux", "selinuxEnabled"))
+                if security.get(key) is True
+            }
+        return names & {"apparmor", "selinux"}
+
     def network_subnet(self, name: str) -> str | None:
         info = self.inspect("network", name)
         if not info:
@@ -140,6 +165,13 @@ class Engine:
         if subnets:
             return subnets[0].get("subnet") or subnets[0].get("Subnet")
         return None
+
+
+def _json_or(text: str, default: Any) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:
+        return default
 
 
 def tar_archive(files: Mapping[str, str], *, uid: int, gid: int, mode: int = 0o600) -> bytes:

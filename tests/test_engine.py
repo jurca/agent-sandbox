@@ -105,3 +105,26 @@ def test_tar_archive_sets_owner_and_mode() -> None:
         assert all((m.uid, m.gid, m.mode) == (65534, 65534, 0o600) for m in members)
         handle = tar.extractfile("a.conf")
         assert handle is not None and handle.read() == b"x\n"
+
+
+@pytest.mark.parametrize(
+    ("kind", "output", "code", "expected"),
+    [
+        ("docker", '["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"]', 0,
+         {"apparmor"}),
+        ("docker", '["name=seccomp,profile=builtin","name=rootless","name=selinux"]', 0,
+         {"selinux"}),
+        ("docker", '["name=seccomp,profile=builtin","name=cgroupns"]', 0, set()),
+        ("docker", "null", 0, set()),
+        ("docker", "not json", 0, set()),
+        ("docker", '["name=apparmor"]', 1, set()),
+        ("podman", '{"apparmorEnabled":false,"selinuxEnabled":true,"seccompEnabled":true}', 0,
+         {"selinux"}),
+        ("podman", '{"apparmorEnabled":true,"selinuxEnabled":false}', 0, {"apparmor"}),
+        ("podman", '["unexpected"]', 0, set()),
+    ],
+)  # fmt: skip
+def test_security_modules(kind: str, output: str, code: int, expected: set[str]) -> None:
+    engine = FakeEngine(kind)
+    engine.on(("info",), lambda args: done(args, output + "\n", code))
+    assert engine.security_modules() == expected

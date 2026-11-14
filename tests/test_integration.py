@@ -417,6 +417,11 @@ def test_status_and_doctor(env: Env, workspace: Path) -> None:
     assert "network:    base tier" in status
     doctor = ok(env, workspace, "doctor").out
     assert "FAIL" not in doctor and "No problems found." in doctor
+    for who in ("the sandbox user", "the proxy"):
+        assert f"ok    {who}: seccomp filter, no-new-privileges, no capabilities" in doctor
+    assert "ok    the sandbox container is not privileged" in doctor
+    lsm_outcomes = ("confined by", "applies no AppArmor or SELinux profile", "rootless sandbox")
+    assert any(outcome in doctor for outcome in lsm_outcomes)
 
 
 @pytest.mark.rootless_only
