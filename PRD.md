@@ -91,7 +91,11 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 - Hardening: default seccomp, AppArmor/SELinux where the engine's host has one (`doctor`
   checks seccomp, no-new-privileges, capabilities and the label from inside the container),
   `no-new-privileges`, default capabilities (so `root` can
-  `apt`), `--init`, no memory limit, no restart policy.
+  `apt`), `--init`, no restart policy. No resource limits unless the user config opts in with
+  a `[resources]` table (defaults pids 4096, memory 4g, cpus 4 for keys it leaves out; `false`
+  lifts one; per-workspace overrides): machine-specific, so never in the project config. They
+  are part of the spec, and limits the engine cannot enforce (docker drops them with a warning
+  when cgroup controllers are not delegated to a rootless engine) refuse creation.
 - Mounts (every workspace path keeps its host path inside, and the working directory of the
   container and of every exec is the workspace root):
   - workspace rw; `.git` ro (file or directory); `.agent-sandbox` ro;

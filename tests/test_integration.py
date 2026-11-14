@@ -738,6 +738,20 @@ def test_drift_requires_recreate(env: Env, scratch: Path) -> None:
     ok(env, scratch, "recreate")
 
 
+def test_resource_limits_reach_the_cgroup(env: Env, scratch: Path) -> None:
+    resources = 'pids = 64\nmemory = "256m"\ncpus = 1\n'
+    env.user_config.write_text(f'[workspaces."{scratch}".resources]\n{resources}')
+    try:
+        limits = "cat /sys/fs/cgroup/pids.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max"
+        result = asb(env, scratch, "exec", "--", "sh", "-c", limits)
+        if result.code != 0 and "cannot enforce" in result.err:
+            pytest.skip("the engine's cgroup controllers are not delegated (refusal: unit tests)")
+        assert result.code == 0, result.text
+        assert result.out.split() == ["64", str(256 * 2**20), "100000", "100000"]
+    finally:
+        env.user_config.unlink()
+
+
 def test_sockets_in_workspace_block_creation(env: Env, scratch: Path) -> None:
     sock = socket.socket(socket.AF_UNIX)
     sock.bind(str(scratch / "agent.sock"))

@@ -154,6 +154,37 @@ class Engine:
             }
         return names & {"apparmor", "selinux"}
 
+    def resource_support(self) -> set[str] | None:
+        """The limits ("pids", "memory", "cpus"; for docker also "swap") the engine can enforce,
+        or None if it cannot tell. Docker only warns about (and drops) a limit whose cgroup
+        controller is missing, as on a rootless engine without cgroup v2 delegation."""
+        if self.kind == "docker":
+            result = self.run("info", "--format", "{{json .}}", check=False)
+            info = _json_or(result.stdout if result.returncode == 0 else "", None)
+            if not isinstance(info, dict):
+                return None
+            keys = {
+                "pids": "PidsLimit", "memory": "MemoryLimit", "cpus": "CpuCfsQuota",
+                "swap": "SwapLimit",
+            }  # fmt: skip
+            return {name for name, key in keys.items() if info.get(key) is True}
+        result = self.run("info", "--format", "{{json .Host.CgroupControllers}}", check=False)
+        controllers = _json_or(result.stdout if result.returncode == 0 else "", None)
+        if not isinstance(controllers, list):
+            return None
+        keys = {"pids": "pids", "memory": "memory", "cpus": "cpu"}
+        return {name for name, controller in keys.items() if controller in controllers}
+
+    def cpu_count(self) -> int | None:
+        """CPUs of the engine's host (a remote docker context reports its own), if it says."""
+        field = "{{.NCPU}}" if self.kind == "docker" else "{{.Host.CPUs}}"
+        result = self.run("info", "--format", field, check=False)
+        try:
+            count = int(result.stdout.strip()) if result.returncode == 0 else 0
+        except ValueError:
+            return None
+        return count if count > 0 else None
+
     def network_subnet(self, name: str) -> str | None:
         info = self.inspect("network", name)
         if not info:

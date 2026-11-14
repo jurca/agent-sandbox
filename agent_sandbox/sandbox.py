@@ -258,6 +258,8 @@ def compute_spec(ctx: Context, plan: Plan, base_id: str | None) -> dict[str, obj
     # Only when used, so containers created before these existed keep their hash.
     if (digest := extension_digest(ctx)) is not None:
         spec["dockerfile"] = digest
+    if limits := resource_limits(ctx):
+        spec["resources"] = limits
     return spec
 
 
@@ -342,6 +344,46 @@ def check_container_paths(ctx: Context, plan: Plan) -> None:
             )
 
 
+RESOURCE_FLAGS = {"pids": "--pids-limit", "memory": "--memory", "cpus": "--cpus"}
+
+
+def resource_limits(ctx: Context) -> dict[str, str]:
+    """The configured limits, `cpus` capped at the engine's CPUs: docker refuses more (and the
+    default of 4 should work on a smaller machine too)."""
+    limits = ctx.user.resource_limits(ctx.project.root)
+    if "cpus" in limits and (count := ctx.engine.cpu_count()) and float(limits["cpus"]) > count:
+        limits["cpus"] = str(count)
+    return limits
+
+
+def check_resources(ctx: Context) -> None:
+    """Refuse limits the engine would drop with only a warning (missing cgroup controllers)."""
+    limits = resource_limits(ctx)
+    if not limits:
+        return
+    wanted = ctx.user.resource_limits(ctx.project.root).get("cpus")
+    if wanted != limits.get("cpus"):
+        eprint(f"note: cpus = {wanted} is more than the engine has; using {limits['cpus']}.")
+    supported = ctx.engine.resource_support()
+    if supported is None:
+        eprint(f"warning: {ctx.engine.kind} does not say which resource limits it can apply.")
+        return
+    if "memory" in limits and ctx.engine.kind == "docker" and "swap" not in supported:
+        eprint(
+            f"warning: docker cannot limit swap here, so memory = {limits['memory']} caps the "
+            "sandbox's RAM only: beyond it, the sandbox uses the host's swap."
+        )
+    missing = [name for name in limits if name not in supported]
+    if missing:
+        raise SandboxError(
+            f"{ctx.engine.mode} cannot enforce the resource limit(s) {', '.join(missing)} from "
+            "the user configuration: their cgroup controllers are not available to it.\n"
+            "A rootless engine needs cgroup v2 with the controllers delegated to your user "
+            "(systemd: `Delegate=` for user@.service). Or lift them, e.g. `memory = false` "
+            "under [resources]."
+        )
+
+
 # --- creation ---------------------------------------------------------------------------
 
 
@@ -414,6 +456,7 @@ def start_proxy(ctx: Context) -> None:
 def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
     engine, project = ctx.engine, ctx.project
     check_container_paths(ctx, make_plan(ctx))  # before building anything
+    check_resources(ctx)
     image = workspace_image(ctx)
     if ctx.config.devcontainer is not None:
         metadata = devcontainer.parse_metadata(engine.labels("image", image.ref) or {})
@@ -478,6 +521,8 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         ]  # fmt: skip
         if plan.ownership == "keep-id":
             args.append("--userns=keep-id")
+        for name, value in resource_limits(ctx).items():
+            args += [RESOURCE_FLAGS[name], value]
         relabel = _selinux_relabel(ctx)
         for mount in plan.mounts:
             args += mount.engine_args(relabel=relabel and mount.target == str(project.root))

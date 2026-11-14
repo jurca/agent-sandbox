@@ -144,8 +144,12 @@ User-level configuration: ~/.config/agent-sandbox/config.toml (never in the repo
                                              be set here
   state_volume = "per-workspace" | "NAME"    "NAME" shares harness logins between workspaces
   harness = ["copilot"]                      harnesses tried before the project's list
-  [workspaces."/abs/path"]                   per-workspace overrides of git, state_volume and
-                                             harness
+  [workspaces."/abs/path"]                   per-workspace overrides of git, state_volume,
+                                             harness and resources
+  [resources]                                opt-in limits for every sandbox; the table alone
+    pids = 4096  memory = "4g"  cpus = 4     applies these defaults, `false` lifts one, and
+                                             `resources = false` in [workspaces."..."] all;
+                                             a change asks for `recreate`
   [proxy] base_image = "..."
   devcontainer_cli = ["devcontainer"]        how to run the devcontainers CLI, for example
                                              ["npx", "@devcontainers/cli"]

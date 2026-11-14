@@ -72,6 +72,12 @@ class ProjectConfig:
     setup_start: list[str] = field(default_factory=list)
 
 
+# Used for the limits a `[resources]` table leaves out: enough for a harness plus parallel unit
+# tests on a laptop. Machines for large data simply do not opt in.
+DEFAULT_RESOURCES: dict[str, int | str | float] = {"pids": 4096, "memory": "4g", "cpus": 4}
+_MEMORY = re.compile(r"^[0-9]+(\.[0-9]+)?[bkmgt]?$", re.IGNORECASE)
+
+
 @dataclass
 class UserConfig:
     engine: str = "auto"
@@ -84,6 +90,16 @@ class UserConfig:
     workspaces: dict[str, dict[str, Any]] = field(default_factory=dict)
     proxy_base_image: str | None = None
     devcontainer_cli: list[str] = field(default_factory=lambda: list(DEFAULT_DEVCONTAINER_CLI))
+    # None: no limits (the default); a table, even an empty one, opts in.
+    resources: dict[str, int | str | float | bool] | None = None
+
+    def resource_limits(self, workspace: Path) -> dict[str, str]:
+        """The limits for this workspace, as engine argument values; `false` lifts one."""
+        override = self.workspaces.get(str(workspace), {}).get("resources")
+        if override is False or (self.resources is None and override is None):
+            return {}
+        merged = {**DEFAULT_RESOURCES, **(self.resources or {}), **(override or {})}
+        return {key: str(value) for key, value in merged.items() if value is not False}
 
     def git_mode(self, workspace: Path) -> str:
         return self.workspaces.get(str(workspace), {}).get("git", self.git)
@@ -413,10 +429,13 @@ def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserC
             "proxy",
             "devcontainer_cli",
             "harness",
+            "resources",
         },
         where,
     )
     config = UserConfig()
+    if "resources" in data:
+        config.resources = _resources(data["resources"], f"{where} [resources]")
     if "harness" in data:
         config.harness = _harness(data["harness"], where)
     if "devcontainer_cli" in data:
@@ -443,8 +462,17 @@ def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserC
     for path, table in _table(data, "workspaces", where).items():
         if not isinstance(table, dict):
             raise SandboxError(f'{where}: [workspaces."{path}"] must be a table.')
-        _only(table, {"git", "state_volume", "harness"}, f'{where} [workspaces."{path}"]')
+        _only(
+            table, {"git", "state_volume", "harness", "resources"}, f'{where} [workspaces."{path}"]'
+        )
         override: dict[str, Any] = {}
+        if "resources" in table:
+            value = table["resources"]
+            override["resources"] = (
+                False
+                if value is False
+                else _resources(value, f'{where} [workspaces."{path}".resources]')
+            )
         if "harness" in table:
             override["harness"] = _harness(table["harness"], f'{where} [workspaces."{path}"]')
         if "git" in table:
@@ -457,6 +485,30 @@ def parse_user_config(data: dict[str, Any], where: str = "user config") -> UserC
     if isinstance(proxy.get("base_image"), str):
         config.proxy_base_image = proxy["base_image"]
     return config
+
+
+def _resources(value: Any, where: str) -> dict[str, int | str | float | bool]:
+    if not isinstance(value, dict):
+        raise SandboxError(f"{where} must be a table (or `resources = false` for a workspace).")
+    _only(value, set(DEFAULT_RESOURCES), where)
+    limits: dict[str, int | str | float | bool] = {}
+    for key, limit in value.items():
+        if limit is False:
+            limits[key] = False
+        elif key == "pids" and type(limit) is int and limit > 0:
+            limits[key] = limit
+        elif key == "memory" and isinstance(limit, str) and _MEMORY.match(limit):
+            limits[key] = limit.lower()
+        elif key == "cpus" and type(limit) in (int, float) and limit > 0:
+            limits[key] = limit
+        else:
+            expected = {
+                "pids": "a positive integer",
+                "memory": 'a size such as "4g" or "512m"',
+                "cpus": "a positive number such as 4 or 1.5",
+            }[key]
+            raise SandboxError(f"{where}: {key} must be {expected}, or false for no limit.")
+    return limits
 
 
 def _git_mode(value: Any, where: str) -> str:

@@ -128,3 +128,39 @@ def test_security_modules(kind: str, output: str, code: int, expected: set[str])
     engine = FakeEngine(kind)
     engine.on(("info",), lambda args: done(args, output + "\n", code))
     assert engine.security_modules() == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "output", "expected"),
+    [
+        ("docker", '{"PidsLimit":true,"MemoryLimit":true,"CpuCfsQuota":true,"SwapLimit":true}',
+         {"pids", "memory", "cpus", "swap"}),
+        ("docker", '{"PidsLimit":true,"MemoryLimit":true,"CpuCfsQuota":true}',
+         {"pids", "memory", "cpus"}),
+        ("docker", '{"PidsLimit":true,"MemoryLimit":false,"CpuCfsQuota":false}', {"pids"}),
+        ("docker", "null", None),
+        ("podman", '["cpuset","cpu","io","memory","pids"]', {"pids", "memory", "cpus"}),
+        ("podman", '["memory","pids"]', {"pids", "memory"}),
+        ("podman", "", None),
+    ],
+)  # fmt: skip
+def test_resource_support(kind: str, output: str, expected: set[str] | None) -> None:
+    engine = FakeEngine(kind)
+    engine.on(("info",), lambda args: output + "\n")
+    assert engine.resource_support() == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "output", "code", "expected"),
+    [
+        ("docker", "{{.NCPU}}", "16", 0, 16),
+        ("podman", "{{.Host.CPUs}}", "8", 0, 8),
+        ("docker", "{{.NCPU}}", "0", 0, None),
+        ("docker", "{{.NCPU}}", "<no value>", 0, None),
+        ("docker", "{{.NCPU}}", "16", 1, None),
+    ],
+)
+def test_cpu_count(kind: str, field: str, output: str, code: int, expected: int | None) -> None:
+    engine = FakeEngine(kind)
+    engine.on(("info", "--format", field), lambda args: done(args, output + "\n", code))
+    assert engine.cpu_count() == expected

@@ -6,6 +6,7 @@ import socket
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -231,6 +232,86 @@ def test_root_shell_gets_the_users_umask(configured: Path, monkeypatch: pytest.M
         sandbox.SHELL_FALLBACK
     )
     assert args[args.index("--user") + 1] == "0"
+
+
+def _with_limits(configured: Path, engine: FakeEngine, resources: dict[str, Any]) -> Context:
+    return make_ctx(configured, engine, user=UserConfig(resources=resources))
+
+
+def test_resource_limits_are_applied_and_part_of_the_spec(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)
+    monkeypatch.setattr(sandbox, "ensure_user_image", lambda *a, **k: fake_image())
+    monkeypatch.setattr(sandbox, "ensure_proxy_image", lambda *a, **k: "proxy:1")
+    monkeypatch.setattr(sandbox, "apply_acls", lambda root, uid, **k: 0)
+    monkeypatch.setattr(sandbox, "start_proxy", lambda ctx: None)
+    engine = FakeEngine()
+    engine.on(("info",), lambda args: '{"PidsLimit":true,"MemoryLimit":true,"CpuCfsQuota":true}')
+    ctx = _with_limits(configured, engine, {"memory": "8g"})
+    sandbox.create_sandbox(ctx)
+    create = next(
+        c for c in engine.calls if c[:3] == ("create", "--name", ctx.project.workspace_container)
+    )
+    joined = " ".join(create)
+    assert "--pids-limit 4096" in joined and "--memory 8g" in joined and "--cpus 4" in joined
+    plan = make_plan(ctx)
+    spec = compute_spec(ctx, plan, "sha256:base")
+    assert spec["resources"] == {"pids": "4096", "memory": "8g", "cpus": "4"}
+    unlimited = compute_spec(make_ctx(configured, engine), plan, "sha256:base")
+    assert "resources" not in unlimited  # containers from before keep their hash
+    assert spec_differences(unlimited, spec) == ["resources"]
+
+
+@pytest.mark.parametrize(("swap", "warned"), [(True, False), (False, True)])
+def test_memory_limit_without_swap_limit_warns(
+    configured: Path, capsys: pytest.CaptureFixture[str], swap: bool, warned: bool
+) -> None:
+    engine = FakeEngine()
+    info = {"PidsLimit": True, "MemoryLimit": True, "CpuCfsQuota": True, "SwapLimit": swap}
+    engine.on(("info",), lambda args: json.dumps(info))
+    sandbox.check_resources(_with_limits(configured, engine, {}))
+    assert ("caps the sandbox's RAM only" in capsys.readouterr().err) == warned
+    sandbox.check_resources(_with_limits(configured, engine, {"memory": False}))
+    assert "RAM only" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("cpus", "count", "applied", "noted"),
+    [(None, 2, "2", True), (None, 16, "4", False), (1.5, 2, "1.5", False), (8, 4, "4", True)],
+)
+def test_cpus_are_capped_at_the_engines_cpus(
+    configured: Path,
+    capsys: pytest.CaptureFixture[str],
+    cpus: float | None,
+    count: int,
+    applied: str,
+    noted: bool,
+) -> None:
+    engine = FakeEngine()
+    engine.on(("info", "--format", "{{.NCPU}}"), lambda args: str(count))
+    engine.on(("info", "--format", "{{json .}}"), lambda args: '{"CpuCfsQuota":true}')
+    ctx = _with_limits(
+        configured,
+        engine,
+        {"pids": False, "memory": False} | ({"cpus": cpus} if cpus is not None else {}),
+    )
+    assert sandbox.resource_limits(ctx) == {"cpus": applied}
+    sandbox.check_resources(ctx)
+    assert ("more than the engine has; using" in capsys.readouterr().err) == noted
+
+
+def test_resource_limits_the_engine_cannot_enforce_are_refused(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)
+    monkeypatch.setattr(sandbox, "workspace_image", lambda ctx: pytest.fail("built an image"))
+    engine = FakeEngine()
+    engine.on(("info",), lambda args: '{"PidsLimit":true,"MemoryLimit":false,"CpuCfsQuota":false}')
+    with pytest.raises(SandboxError, match=r"(?s)resource limit\(s\) memory, cpus .*Delegate="):
+        sandbox.create_sandbox(_with_limits(configured, engine, {}))
+    # Lifting them is enough.
+    sandbox.check_resources(_with_limits(configured, engine, {"memory": False, "cpus": False}))
 
 
 def test_command_with_umask() -> None:

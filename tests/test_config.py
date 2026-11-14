@@ -276,3 +276,49 @@ def test_mount_paths_with_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         MountSpec(f"{tmp_path}/.agents/skills", "~/.agents/skills"),
         MountSpec("/a", "{home}/a"),
     ]
+
+
+DEFAULT_LIMITS = {"pids": "4096", "memory": "4g", "cpus": "4"}
+
+
+@pytest.mark.parametrize(
+    ("data", "workspace", "expected"),
+    [
+        ({}, "/w", {}),  # opt-in: no table, no limits
+        ({"resources": {}}, "/w", DEFAULT_LIMITS),
+        ({"resources": {"memory": "16G", "cpus": 1.5}}, "/w",
+         {"pids": "4096", "memory": "16g", "cpus": "1.5"}),
+        ({"resources": {"memory": False}}, "/w", {"pids": "4096", "cpus": "4"}),
+        ({"resources": {}, "workspaces": {"/big": {"resources": {"memory": False}}}}, "/big",
+         {"pids": "4096", "cpus": "4"}),
+        ({"resources": {}, "workspaces": {"/big": {"resources": False}}}, "/big", {}),
+        ({"resources": {}, "workspaces": {"/big": {"resources": False}}}, "/other",
+         DEFAULT_LIMITS),
+        ({"workspaces": {"/only": {"resources": {"pids": 512}}}}, "/only",
+         {"pids": "512", "memory": "4g", "cpus": "4"}),
+        ({"workspaces": {"/only": {"resources": {"pids": 512}}}}, "/other", {}),
+    ],
+)  # fmt: skip
+def test_resource_limits(data: dict[str, Any], workspace: str, expected: dict[str, str]) -> None:
+    assert parse_user_config(data).resource_limits(Path(workspace)) == expected
+
+
+@pytest.mark.parametrize(
+    ("resources", "message"),
+    [
+        ("4g", "must be a table"),
+        ({"swap": "1g"}, "unknown key"),
+        ({"pids": 0}, "pids must be a positive integer"),
+        ({"pids": True}, "pids must be a positive integer"),
+        ({"pids": "4096"}, "pids must be a positive integer"),
+        ({"memory": 4}, 'memory must be a size such as "4g"'),
+        ({"memory": "4 GB"}, 'memory must be a size such as "4g"'),
+        ({"cpus": 0}, "cpus must be a positive number"),
+        ({"cpus": "4"}, "cpus must be a positive number"),
+    ],
+)
+def test_resource_errors(resources: Any, message: str) -> None:
+    with pytest.raises(SandboxError, match=message):
+        parse_user_config({"resources": resources})
+    with pytest.raises(SandboxError, match=message):
+        parse_user_config({"workspaces": {"/w": {"resources": resources}}})
