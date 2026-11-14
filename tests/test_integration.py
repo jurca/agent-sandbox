@@ -4,10 +4,13 @@ They need a container engine, outbound HTTPS to example.com and, for rootless do
 A rootful engine needs AGENT_SANDBOX_ALLOW_ROOTFUL=1. Tests marked `rootless_only` or
 `rootful_only` are skipped on an engine of the other mode.
 
-Everything lives in /tmp/asb-it-* with isolated AGENT_SANDBOX_*_DIR; finalizers run
-`rm --state`. Images are never pulled: ASB_TEST_IMAGE (default: a local devcontainer image whose
-uid 1000 user exists) must be present, and the derived-image tests use the locally built
-tinyproxy image as their Alpine base. The devcontainer test only runs when
+Everything lives in $ASB_TEST_DIR/asb-it-* (default /var/tmp: the CLI refuses workspaces under
+/tmp, and one under the home directory would sit below the sandbox user's home in the container)
+with isolated AGENT_SANDBOX_*_DIR; finalizers run `rm --state`.
+
+Images are never pulled: ASB_TEST_IMAGE (default: a local devcontainer image whose uid 1000 user
+exists) must be present, and the derived-image tests use the locally built tinyproxy image as
+their Alpine base. The devcontainer test only runs when
 ASB_TEST_DEVCONTAINER_CLI names the devcontainers CLI (e.g. "npx @devcontainers/cli") and
 ASB_TEST_DEVCONTAINER_IMAGE (default debian:bookworm-slim) is present; it uses a local Feature,
 so it needs no registry.
@@ -48,6 +51,7 @@ pytestmark = pytest.mark.integration
 
 LAUNCHER = str(Path(__file__).resolve().parent.parent / "agent-sandbox")
 IMAGE = os.environ.get("ASB_TEST_IMAGE", "python:3.14")
+TEST_DIR = Path(os.environ.get("ASB_TEST_DIR") or "/var/tmp").expanduser()
 DEFAULT_HARNESS_LINE = 'harness = ["claude", "copilot", "bash", "sh"]'
 ENGINE = os.environ.get("ASB_TEST_ENGINE", "docker")
 
@@ -123,7 +127,8 @@ def env() -> Iterator[Env]:
         pytest.skip(f"{ENGINE} is rootful: set AGENT_SANDBOX_ALLOW_ROOTFUL=1 to test it")
     if not has_image(IMAGE):
         pytest.skip(f"{IMAGE} is not present locally (set ASB_TEST_IMAGE)")
-    base = Path(tempfile.mkdtemp(prefix="asb-it-", dir="/tmp"))
+    TEST_DIR.mkdir(parents=True, exist_ok=True)
+    base = Path(tempfile.mkdtemp(prefix="asb-it-", dir=TEST_DIR)).resolve()
     variables = {
         **os.environ,
         "AGENT_SANDBOX_CONFIG_DIR": str(base / "config"),
@@ -357,6 +362,17 @@ def test_protected_paths_are_read_only_and_isolated_paths_are_separate(
     assert sh(env, workspace, "ls .venv") == "made-inside\n"  # the volume survives recreate
 
 
+def test_workspace_under_tmp_is_refused(env: Env) -> None:
+    root = make_repo(Path(tempfile.mkdtemp(prefix="asb-it-tmp-", dir="/tmp")) / "repo")
+    try:
+        configure(root, env)
+        result = asb(env, root, "exec", "--", "true")
+        assert result.code == 1 and f"The workspace {root} is under /tmp" in result.err
+        assert engine("container", "inspect", f"agent-sandbox-{make_id(root)}").returncode != 0
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
 def test_state_dirs_belong_to_the_user_and_survive_recreate(env: Env, scratch: Path) -> None:
     out = sh(
         env,
@@ -380,9 +396,8 @@ def test_tmp_is_a_fresh_executable_tmpfs_on_every_start(env: Env, scratch: Path)
     )
     assert sh(env, scratch, script) == "tmpfs\nran\n"
     assert "Stopped:" in ok(env, scratch, "stop").out
-    # Only the workspace's mount point remains (the scratch repo lives under /tmp/asb-it-*).
     out = sh(env, scratch, "ls -A /tmp; stat -c %a /tmp; cat /var/tmp/marker")
-    assert out == f"{env.base.name}\n1777\nkept\n"  # /var/tmp keeps its contents
+    assert out == "1777\nkept\n"  # /tmp is empty again; /var/tmp keeps its contents
 
 
 def test_proxy_is_unprivileged_without_host_mounts(env: Env, workspace: Path) -> None:

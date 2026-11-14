@@ -105,6 +105,8 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
   - state volumes under the container home;
   - a fresh tmpfs on `/tmp` (`rw,exec,nosuid,nodev,mode=1777`, no size cap), so `/tmp` starts
     empty on every start like on a rebooted host. `/var/tmp` stays on the container's disk.
+    Creating a sandbox refuses a workspace, an external git dir or a `[[mounts]]` target under
+    `/tmp`: the engine would create their parents in the tmpfs, owned by root.
 - `git = "rw"` (writable `.git` and external git dirs) is a user-level-only opt-in.
 - Mirroring the host path keeps absolute paths meaningful on both sides: tool output and
   tracebacks are clickable on the host, caches and editable installs (`.pth`) agree, worktree
@@ -592,7 +594,8 @@ secrets already committed, unless the history check finds them: the agent can re
   settings, lifecycle steps, `${...}` substitution), configuration checks and lockfile errors, the
   setup phases and their records, image layering and the spec.
 - Integration tests (marked `integration`, opt-in with `pytest --integration`, on the user's rootless
-  docker, using temp repos under `/tmp/asb-it-*` and isolated `AGENT_SANDBOX_*_DIR`; no image pulls, so
+  docker, using temp repos under `$ASB_TEST_DIR/asb-it-*` (default `/var/tmp`) and isolated
+  `AGENT_SANDBOX_*_DIR`; no image pulls, so
   the base image must be local): create and exec, ownership/ACL, a file replaced by `sed -i` in the
   sandbox stays writable on the host, `repair` reclaims a sub-uid-owned file the host cannot write,
   read-only `.git`, tiers via
@@ -642,7 +645,9 @@ secrets already committed, unless the history check finds them: the agent can re
   `size=` cap (the kernel default is half of RAM): with no memory limit, large temp files cost
   host RAM/swap, which is accepted over builds failing on a cap; `/var/tmp` remains on disk. Wiping
   `/tmp` at start instead was rejected: a workspace under `/tmp` is bind-mounted there and would be
-  deleted.
+  deleted. Such workspaces are refused at creation instead (keeping the host path inside means
+  their parents would be root-owned directories in the tmpfs; Claude Code, for one, refuses a
+  root-owned `/tmp/claude-<uid>`).
 - **File-system watcher fixing ownership/ACLs as they drift**: rejected. Symmetric ACLs remove
   the common cause (replaced files carrying a copied ACL). A watcher would be a host daemon that
   has to run whenever the sandbox runs, needs inotify watches for the whole tree, races the agent's

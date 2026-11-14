@@ -63,7 +63,8 @@ from .util import SandboxError, eprint, exclusive_lock, require_phrase, runtime_
 SPEC_VERSION = 2
 # Engines keep the writable layer across stop/start; a tmpfs gives every start an empty /tmp.
 # `exec` because Podman defaults to `noexec`; no `size=` (the kernel default is half of RAM).
-TMP_TMPFS = "/tmp:rw,exec,nosuid,nodev,mode=1777"
+CONTAINER_TMP = "/tmp"
+TMP_TMPFS = f"{CONTAINER_TMP}:rw,exec,nosuid,nodev,mode=1777"
 PROXY_URL = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
 ROOT_ACK_PHRASE = "I understand the risks"
 STOP_TIMEOUT = "3"
@@ -308,6 +309,39 @@ def check_sockets(ctx: Context, plan: Plan, *, unsafe: bool) -> None:
     require_phrase(ROOT_ACK_PHRASE)
 
 
+def check_container_paths(ctx: Context, plan: Plan) -> None:
+    """Refuse mounts under the container's /tmp: it is a fresh tmpfs, so the engine would have
+    to create their parents in it, owned by root (and the workspace keeps its host path)."""
+    tmp = PurePosixPath(CONTAINER_TMP)
+
+    def under_tmp(path: str | Path) -> bool:
+        posix = PurePosixPath(path)
+        return posix == tmp or tmp in posix.parents
+
+    reason = (
+        f"{CONTAINER_TMP} is an empty tmpfs inside the sandbox, so the engine would create its "
+        f"parent directories there, owned by root"
+    )
+    root = ctx.project.root
+    if under_tmp(root):
+        raise SandboxError(
+            f"The workspace {root} is under {CONTAINER_TMP}: {reason}.\n"
+            f"Move or clone the repository to a directory outside {CONTAINER_TMP}."
+        )
+    for directory in plan.layout.external_dirs:
+        if under_tmp(directory):
+            raise SandboxError(
+                f"The git directory {directory} of this worktree is under {CONTAINER_TMP}: "
+                f"{reason}.\nCreate the worktree from a repository outside {CONTAINER_TMP}."
+            )
+    for mount in plan.mounts:
+        if under_tmp(mount.target):
+            raise SandboxError(
+                f"Mount target {mount.target} is under {CONTAINER_TMP}: {reason}.\n"
+                f"Give its [[mounts]] entry a `target` outside {CONTAINER_TMP}."
+            )
+
+
 # --- creation ---------------------------------------------------------------------------
 
 
@@ -379,6 +413,7 @@ def start_proxy(ctx: Context) -> None:
 
 def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
     engine, project = ctx.engine, ctx.project
+    check_container_paths(ctx, make_plan(ctx))  # before building anything
     image = workspace_image(ctx)
     if ctx.config.devcontainer is not None:
         metadata = devcontainer.parse_metadata(engine.labels("image", image.ref) or {})
@@ -386,6 +421,7 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
             eprint(f"warning: {message}")
     proxy_image = ensure_proxy_image(engine, ctx.proxy_base_image)
     plan = make_plan(ctx, image.home)
+    check_container_paths(ctx, plan)  # again: `~` in mount targets is the image's home now
     check_sockets(ctx, plan, unsafe=unsafe_sockets)
     # Mount points inside the workspace; the engine would create missing ones itself, but
     # with root-owned results under a rootful engine.

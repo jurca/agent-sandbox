@@ -112,6 +112,58 @@ def test_plan_for_worktree_mounts_common_dir_at_host_path(repo: Path, tmp_path: 
     assert BindMount(str(repo / ".git"), str(repo / ".git"), readonly=True) in plan.mounts
 
 
+OTHER_TMP = "/agent-sandbox-test-tmp"  # stands in for the container's /tmp where it matters
+
+
+@pytest.mark.parametrize("parent", [True, False])
+def test_workspace_under_container_tmp_is_refused(
+    configured: Path, monkeypatch: pytest.MonkeyPatch, parent: bool
+) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", str(configured.parent if parent else configured))
+    ctx = make_ctx(configured)
+    with pytest.raises(SandboxError, match=f"(?s)The workspace {configured} is under .*outside"):
+        sandbox.check_container_paths(ctx, make_plan(ctx))
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)
+    sandbox.check_container_paths(ctx, make_plan(ctx))
+
+
+def test_worktree_git_dir_under_container_tmp_is_refused(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    git(repo, "worktree", "add", "-q", str(tree))
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", str(repo))  # the main repository, not the tree
+    ctx = make_ctx(tree.resolve())
+    with pytest.raises(SandboxError, match=f"The git directory {repo}/.git of this worktree"):
+        sandbox.check_container_paths(ctx, make_plan(ctx))
+
+
+@pytest.mark.parametrize("target", [f"{OTHER_TMP}/data", OTHER_TMP])
+def test_mount_target_under_container_tmp_is_refused(
+    configured: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = make_ctx(
+        configured, config=ProjectConfig(image=IMAGE, mounts=[MountSpec(str(data), target)])
+    )
+    expected = f"(?s)Mount target {target} is under .*\\[\\[mounts\\]\\] entry"
+    with pytest.raises(SandboxError, match=expected):
+        sandbox.check_container_paths(ctx, make_plan(ctx))
+
+
+def test_create_refuses_a_workspace_under_tmp_before_building(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", str(configured.parent))
+    monkeypatch.setattr(sandbox, "workspace_image", lambda ctx: pytest.fail("built an image"))
+    engine = FakeEngine()
+    with pytest.raises(SandboxError, match="is under"):
+        sandbox.create_sandbox(make_ctx(configured, engine))
+    assert engine.calls == []
+
+
 def test_plan_git_rw_only_from_user_config(configured: Path) -> None:
     user = UserConfig(workspaces={str(configured): {"git": "rw"}})
     plan = make_plan(make_ctx(configured, user=user))
@@ -417,6 +469,7 @@ def fake_image(home: str = "/home/dev") -> UserImage:
 
 
 def test_create_rolls_back_on_failure(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)  # tmp_path is usually below /tmp
     engine = FakeEngine()
     ctx = make_ctx(configured, engine)
     monkeypatch.setattr(sandbox, "ensure_user_image", lambda *a, **k: fake_image())
@@ -440,6 +493,7 @@ def test_create_rolls_back_on_failure(configured: Path, monkeypatch: pytest.Monk
 
 
 def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox, "CONTAINER_TMP", OTHER_TMP)
     engine = FakeEngine()
     ctx = make_ctx(configured, engine)
     acl_calls: list[int] = []
