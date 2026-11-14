@@ -198,7 +198,7 @@ def detect_engine(user: UserConfig) -> Engine:
     allowed = user.allow_rootful or os.environ.get(ENGINE_ENV_ROOTFUL) == "1"
     if not engine.rootless and not allowed:
         raise EngineError(
-            f"{engine.mode} is a rootful engine: root inside the container is root on this host.\n"
+            f"{engine.kind} runs rootful: root inside the container is root on this host.\n"
             "If you accept that, set `allow_rootful = true` in "
             "~/.config/agent-sandbox/config.toml."
         )

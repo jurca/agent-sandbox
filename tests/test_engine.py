@@ -88,7 +88,7 @@ def test_unusable_engine_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_rootful_needs_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_probe(monkeypatch, {"docker": '["name=seccomp,profile=builtin"]'})
     monkeypatch.delenv(engine_mod.ENGINE_ENV_ROOTFUL, raising=False)
-    with pytest.raises(EngineError, match="allow_rootful"):
+    with pytest.raises(EngineError, match=r"(?s)^docker runs rootful: root inside .*allow_rootful"):
         detect_engine(UserConfig())
     assert not detect_engine(UserConfig(allow_rootful=True)).rootless
     monkeypatch.setenv(engine_mod.ENGINE_ENV_ROOTFUL, "1")
