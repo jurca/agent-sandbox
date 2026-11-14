@@ -1,6 +1,6 @@
 # agent-sandbox - product requirements
 
-Status: implemented and tested on rootless docker (see section 10); podman and rootful untested.
+Status: implemented and tested on rootless and rootful docker (see section 10); podman untested.
 Section 6 (environment setup, devcontainer base) is implemented and tested the same way.
 "Secret files" in section 8 is implemented and tested the same way.
 The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
@@ -45,7 +45,9 @@ Key properties:
 - The container sits on an **internal network** (no route out). Its only way out is a tinyproxy
   container with an allowlist. Blocking the internal network (10.0.0.0/8) by default is required
   by security policy.
-- Rootless engines are preferred; rootful is supported with an explicit opt-in.
+- Rootless engines are preferred; rootful is supported with an explicit opt-in, since its
+  isolation is weaker: root in the sandbox is root on the host (a root shell can, for one, leave
+  setuid files in the workspace).
 
 Non-goals: protection against kernel/container-runtime escapes (use a VM for that); managing VS
 Code attach; installing harnesses automatically; DinD.
@@ -56,8 +58,8 @@ Code attach; installing harnesses automatically; DinD.
 - Layout: `agent_sandbox/` package, thin `agent-sandbox` launcher (symlink into PATH),
   `pyproject.toml`, `tests/`, a minimal `README.md` that only points to `agent-sandbox help`.
 - Engines: docker rootless, docker rootful, podman rootless (`--userns=keep-id`), podman rootful.
-  Auto-detection tries podman first, then docker. Only rootless docker could be tested during
-  development (no podman installed, no rootful docker).
+  Auto-detection tries podman first, then docker. Only docker, rootless and rootful, could be
+  tested during development (no podman installed).
 - Must refuse to run as host root.
 
 ## 3. Architecture
@@ -600,11 +602,14 @@ secrets already committed, unless the history check finds them: the agent can re
   the sandbox user is the host user, mount validation, socket scan, approval (trees, binary files,
   old snapshots), argument parsing, probe parsing, devcontainer metadata (remote user, not-applied
   settings, lifecycle steps, `${...}` substitution), configuration checks and lockfile errors, the
-  setup phases and their records, image layering and the spec.
-- Integration tests (marked `integration`, opt-in with `pytest --integration`, on the user's rootless
-  docker, using temp repos under `$ASB_TEST_DIR/asb-it-*` (default `/var/tmp`) and isolated
-  `AGENT_SANDBOX_*_DIR`; no image pulls, so
-  the base image must be local): create and exec, ownership/ACL, a file replaced by `sed -i` in the
+  setup phases and their records, image layering and the spec, resource limits (merging, the CPU
+  cap, limits the engine cannot enforce), the `/tmp` refusal, `doctor`'s security and root-owned
+  file checks.
+- Integration tests (marked `integration`, opt-in with `pytest --integration`, on rootless docker
+  and on rootful docker with `AGENT_SANDBOX_ALLOW_ROOTFUL=1`; tests marked `rootless_only` or
+  `rootful_only` skip on the other mode), using temp repos under `$ASB_TEST_DIR/asb-it-*`
+  (default `/var/tmp`) and isolated `AGENT_SANDBOX_*_DIR`; no image pulls, so the base image
+  must be local): create and exec, ownership/ACL, a file replaced by `sed -i` in the
   sandbox stays writable on the host, `repair` reclaims a sub-uid-owned file the host cannot write,
   read-only `.git`, tiers via
   `CONNECT`/`GET` through `/dev/tcp/proxy/8888`, `net` expiry/extend/stop/SIGKILL, allow-all, promotion,
@@ -617,13 +622,15 @@ secrets already committed, unless the history check finds them: the agent can re
   `.agent-sandbox/Dockerfile` layer and its drift; a devcontainer `remoteUser` remapped or
   created; and, when `ASB_TEST_DEVCONTAINER_CLI` is set, the devcontainer flow (missing lockfile,
   `upgrade`, build with a local Feature, lifecycle commands, `remoteEnv`, read-only
-  `.devcontainer/`).
+  `.devcontainer/`); `repair` not following symlinks in the container, the root shell's umask,
+  `doctor`'s security checks, resource limits reaching the cgroup, a workspace under `/tmp`
+  refused; rootful only: `doctor` reporting the root-owned and setuid files a root shell left.
 - Secret files, integration: a dangling link in the container; refusal on a real file, a link
   outside `secrets/`, a tracked file and an excludes-only rule; `adopt` then a clean start; the
   check on `exec` against a running sandbox; the history check off by default, refusing a match
   within `secrets_history_depth`, missing one beyond it, passing after `secrets rotated`, and
   refusing again after a new commit at the path.
-- Not covered end to end: podman, rootful engines, a real upstream proxy, submodule workspaces,
+- Not covered end to end: podman, a real upstream proxy, submodule workspaces,
   `rebuild` (it pulls the proxy base image).
 - `ruff check`, `ruff format`, `ty check` must pass.
 
@@ -701,7 +708,7 @@ secrets already committed, unless the history check finds them: the agent can re
 
 ## 12. Deferred / out of scope for v1
 
-OpenCode defaults; Podman and rootful verification;
+OpenCode defaults; Podman verification;
 Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
 user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
 project config); resolving symlinks inside mounted skill directories (links pointing outside the

@@ -21,7 +21,9 @@ to resist. See `agent-sandbox help security`.
 ## Requirements
 
 - Linux, Python 3.12+ (standard library only)
-- Rootless docker or podman (rootful engines need an explicit opt-in)
+- Rootless docker or podman. Rootful docker is supported and tested too, but needs an explicit
+  opt-in (`allow_rootful = true`, see `agent-sandbox help config`): its isolation is weaker,
+  since root in the sandbox is root on the host.
 - `git`; `setfacl` for rootless docker (`apt install acl`)
 
 ## Install
