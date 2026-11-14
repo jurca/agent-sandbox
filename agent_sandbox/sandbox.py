@@ -891,8 +891,10 @@ def run_in_container(ctx: Context, command: list[str] | None = None, *, root: bo
             "-e", "AGENT_SANDBOX_ROOT=1",
             "-e", r"PROMPT_COMMAND=PS1='\[\e[41;97m\] ROOT \[\e[0m\] \w # '",
         ]  # fmt: skip
-        argv = ["sh", "-c", 'printf "%s" "$AGENT_SANDBOX_BANNER" >&2; exec "$@"', "sh"]
-        argv += command or SHELL_FALLBACK
+        # The user's umask here too: an exec starts with the engine's, which can be 0000 (seen
+        # with docker 29), so what root creates in the workspace would be world-writable.
+        banner = ["sh", "-c", 'printf "%s" "$AGENT_SANDBOX_BANNER" >&2; exec "$@"', "sh"]
+        argv = command_with_umask([*banner, *(command or SHELL_FALLBACK)], ctx.umask)
     else:
         env = user_exec_env(ctx, current)
         args += env

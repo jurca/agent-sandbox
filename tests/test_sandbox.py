@@ -165,6 +165,22 @@ def test_spec_hash_and_differences(configured: Path) -> None:
     assert spec_differences({k: v for k, v in spec.items() if k != "tmp"}, spec) == ["tmp"]
 
 
+def test_root_shell_gets_the_users_umask(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = FakeEngine()
+    ctx = make_ctx(configured, engine)
+    engine.add("container", ctx.project.workspace_container, {})
+    replaced: list[list[str]] = []
+    monkeypatch.setattr(engine, "exec_replace", replaced.append)
+    sandbox.run_in_container(ctx, root=True)
+    (args,) = replaced
+    argv = args[args.index(ctx.project.workspace_container) + 1 :]
+    assert argv[:4] == ["sh", "-c", 'umask "$0"; exec "$@"', "0022"]
+    assert "AGENT_SANDBOX_BANNER" in argv[6] and argv[-len(sandbox.SHELL_FALLBACK) :] == (
+        sandbox.SHELL_FALLBACK
+    )
+    assert args[args.index("--user") + 1] == "0"
+
+
 def test_command_with_umask() -> None:
     assert sandbox.command_with_umask(["claude", "--x"], 0o027) == [
         "sh", "-c", 'umask "$0"; exec "$@"', "0027", "claude", "--x",

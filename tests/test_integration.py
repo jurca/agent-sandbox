@@ -498,10 +498,12 @@ def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
     finally:
         config.write_text(original)
         approve(env, workspace)
-    result = ok(env, workspace, "root", stdin="id -u\n")
+    result = ok(env, workspace, "root", stdin="id -u; umask\n")
     mode_note = "Rootless engine" if engine_is_rootless() else "ROOTFUL engine"
     assert "ROOT SHELL" in result.err and mode_note in result.err
-    assert result.out.strip() == "0"
+    umask = os.umask(0)
+    os.umask(umask)
+    assert result.out.split() == ["0", f"{umask:04o}"]  # the user's umask, not the engine's
 
 
 def test_harness_in_local_bin_is_found(env: Env, workspace: Path) -> None:
