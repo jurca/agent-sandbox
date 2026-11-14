@@ -1,7 +1,7 @@
 # agent-sandbox
 
-Per-workspace containers for AI agent harnesses (Claude Code, Copilot CLI), with the workspace
-bind-mounted, `.git` read-only and network access only through an allowlisting proxy.
+Per-workspace containers for AI agent harnesses (Claude Code, Copilot CLI, OpenCode), with
+the workspace bind-mounted, `.git` read-only and network access only through an allowlisting proxy.
 
 This is an experimental project exploring stronger AI agent sandboxing approaches. There are also
 plenty [known alternatives](https://seznam.github.io/jailoc/explanation/alternatives/) with their

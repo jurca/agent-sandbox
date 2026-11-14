@@ -7,9 +7,9 @@ The previous bash-based version is tagged `v0.1.0`; this is a clean restart.
 
 ## 1. Purpose and threat model
 
-Run AI agent harnesses (Claude Code, GitHub Copilot CLI, OpenCode later) against a git working
-tree inside a per-workspace container, so that mistakes or prompt injection cannot damage the host.
-The concern is accident and manipulation, not malice by the user.
+Run AI agent harnesses (Claude Code, GitHub Copilot CLI, OpenCode) against a git working tree
+inside a per-workspace container, so that mistakes or prompt injection cannot damage the host. The
+concern is accident and manipulation, not malice by the user.
 
 Key properties:
 
@@ -195,11 +195,12 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 ### Project: `.agent-sandbox/` (committed)
 
 - `config.toml`: `image` or `[devcontainer] enabled`/`config` (exactly one, section 6), `harness`
-  (a command line or a list of them, default `["claude", "copilot", "bash", "sh"]`), `[env] pass`/`[env.set]`,
-  `[workspace] protected` (default `.claude`, `.agents`, `.vscode`, `.idea`, `.devcontainer`),
-  `[workspace] isolated` (default `.venv`, `node_modules`), `[workspace] secrets`,
-  `secrets_except` and `secrets_history_depth` (section 8, "Secret files"), `[[mounts]]` (`source`, `target`
-  defaulting to `source`, always read-only), `[state] paths` (default `.claude`, `.copilot`,
+  (a command line or a list of them, default `["claude", "copilot", "opencode", "bash", "sh"]`),
+  `[env] pass`/`[env.set]`, `[workspace] protected` (default `.claude`, `.agents`, `.vscode`,
+  `.idea`, `.devcontainer`), `[workspace] isolated` (default `.venv`, `node_modules`),
+  `[workspace] secrets`, `secrets_except` and `secrets_history_depth` (section 8, "Secret files"),
+  `[[mounts]]` (`source`, `target` defaulting to `source`, always read-only), `[state] paths`
+  (default `.claude`, `.copilot`, `.local/share/opencode`, `.config/opencode`,
   `.cache/pre-commit`), `[proxy] base_image`, `[setup] create`/`start`. Unknown keys are errors.
 - Workspace paths (`protected`, `isolated`) are relative to the workspace root and normalised
   (`./x/` -> `x`); absolute paths, `..`, `.`, anything under `.git` or `.agent-sandbox` (already
@@ -584,7 +585,10 @@ secrets already committed, unless the history check finds them: the agent can re
   `[env] pass` to avoid per-workspace logins.
 - Copilot CLI: `github.com`, `api.github.com`, `.githubcopilot.com` (docs are for Copilot in general,
   not specifically the CLI; verify with the blocked-host log). State: `~/.copilot/`.
-- OpenCode: low priority, hosts depend on the provider (Zen subscription hosts to be determined).
+- OpenCode: `opencode.ai` and `models.opencode.ai`, also `registry.npmjs.org` for installation.
+  State: `~/.local/share/opencode/` (credentials, the session database, logs) and
+  `~/.config/opencode/` (global config); both are default state paths. `~/.opencode/bin` is only
+  where the install script puts the binary, not state.
 - pre-commit: keeps hook environments in `~/.cache/pre-commit` (a default state path; safe to share
   between workspaces, entries are keyed by repo and revision and guarded by a lock). Without
   `--all-files`/`--files` it "stashes" unstaged changes as a patch in that directory and calls
@@ -708,10 +712,10 @@ secrets already committed, unless the history check finds them: the agent can re
 
 ## 12. Deferred / out of scope for v1
 
-OpenCode defaults; Podman verification;
-Squid as an alternative proxy (documented option if IP-level enforcement is ever required);
-user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed
-project config); resolving symlinks inside mounted skill directories (links pointing outside the
-mount dangle in the container); a host-side watcher stopping the container when a real secret file
-appears mid-session (needs a process that outlives `exec`, which today replaces the launcher, and
-still leaves a short window); a user-level secrets directory other than `<config dir>/secrets/`.
+Podman verification; Squid as an alternative proxy (documented option if IP-level enforcement is
+ever required); user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live
+in the committed project config); resolving symlinks inside mounted skill directories (links
+pointing outside the mount dangle in the container); a host-side watcher stopping the container
+when a real secret file appears mid-session (needs a process that outlives `exec`, which today
+replaces the launcher, and still leaves a short window); a user-level secrets directory other than
+`<config dir>/secrets/`.

@@ -104,7 +104,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
                    (see `help setup`); config = ".devcontainer/<name>/devcontainer.json"
                    picks another one than .devcontainer/devcontainer.json
   harness          command line, or list of them, started by a plain `agent-sandbox`: the
-                   first one installed in the container (default: claude copilot bash sh)
+                   first one installed in the container (default: claude copilot opencode bash
+                   sh)
   [env] pass       host variables to pass into the container (when set)
   [env.set]        fixed variables; {{home}} expands to the container home directory
   [workspace] protected
@@ -126,7 +127,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
                    and check_sockets = false skip the (bounded) secret file and unix socket
                    checks of the mount
   [state] paths    directories under the container home kept in a volume
-                   (per workspace by default; default: .claude .copilot .cache/pre-commit)
+                   (per workspace by default; default: .claude .copilot .local/share/opencode
+                   .config/opencode .cache/pre-commit)
   [proxy] base_image   image tinyproxy is installed on (default: alpine:3)
   [setup] create   shell commands run once per container before the first harness start,
                    with allow.extra reachable (e.g. "uv sync", "pre-commit install-hooks")

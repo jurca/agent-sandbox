@@ -52,7 +52,7 @@ pytestmark = pytest.mark.integration
 LAUNCHER = str(Path(__file__).resolve().parent.parent / "agent-sandbox")
 IMAGE = os.environ.get("ASB_TEST_IMAGE", "python:3.14")
 TEST_DIR = Path(os.environ.get("ASB_TEST_DIR") or "/var/tmp").expanduser()
-DEFAULT_HARNESS_LINE = 'harness = ["claude", "copilot", "bash", "sh"]'
+DEFAULT_HARNESS_LINE = 'harness = ["claude", "copilot", "opencode", "bash", "sh"]'
 ENGINE = os.environ.get("ASB_TEST_ENGINE", "docker")
 
 PROBE = r"""
@@ -377,9 +377,11 @@ def test_state_dirs_belong_to_the_user_and_survive_recreate(env: Env, scratch: P
     out = sh(
         env,
         scratch,
-        'stat -c %u "$HOME/.claude" "$HOME/.copilot"; echo kept > "$HOME/.claude/marker"',
+        'stat -c %u "$HOME/.claude" "$HOME/.copilot" "$HOME/.local" "$HOME/.local/share"'
+        ' "$HOME/.local/share/opencode" "$HOME/.config/opencode";'
+        ' echo kept > "$HOME/.claude/marker"',
     )
-    assert out.split() == [str(os.getuid())] * 2
+    assert out.split() == [str(os.getuid())] * 6
     ok(env, scratch, "recreate")
     assert sh(env, scratch, 'cat "$HOME/.claude/marker"') == "kept\n"
     ok(env, scratch, "rm")
@@ -822,7 +824,13 @@ def test_linked_worktree_with_shared_state_volume(env: Env, workspace: Path) -> 
     volume = f"agent-sandbox-state-shared-{shared}-claude"
     shared_volumes = [
         f"agent-sandbox-state-shared-{shared}-{suffix}"
-        for suffix in ("claude", "copilot", "cache-pre-commit")
+        for suffix in (
+            "claude",
+            "copilot",
+            "local-share-opencode",
+            "config-opencode",
+            "cache-pre-commit",
+        )
     ]
     env.user_config.write_text(f'[workspaces."{tree}"]\nstate_volume = "{shared}"\n')
     try:

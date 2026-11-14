@@ -82,6 +82,8 @@ def test_plan_for_plain_clone(configured: Path) -> None:
     assert plan.volumes == [
         (f"agent-sandbox-state-{p.id}-claude", ".claude"),
         (f"agent-sandbox-state-{p.id}-copilot", ".copilot"),
+        (f"agent-sandbox-state-{p.id}-local-share-opencode", ".local/share/opencode"),
+        (f"agent-sandbox-state-{p.id}-config-opencode", ".config/opencode"),
         (f"agent-sandbox-state-{p.id}-cache-pre-commit", ".cache/pre-commit"),
     ]
     assert plan.isolated == [
@@ -567,6 +569,8 @@ def test_create_rolls_back_on_failure(configured: Path, monkeypatch: pytest.Monk
         ("volume", "rm", p.isolated_volume("node_modules")),
         ("volume", "rm", p.isolated_volume(".venv")),
         ("volume", "rm", f"agent-sandbox-state-{p.id}-cache-pre-commit"),
+        ("volume", "rm", f"agent-sandbox-state-{p.id}-config-opencode"),
+        ("volume", "rm", f"agent-sandbox-state-{p.id}-local-share-opencode"),
         ("volume", "rm", f"agent-sandbox-state-{p.id}-copilot"),
         ("volume", "rm", f"agent-sandbox-state-{p.id}-claude"),
         ("network", "rm", p.network),
@@ -603,8 +607,10 @@ def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> 
     )
     chown = next(c for c in engine.calls if c[:3] == ("exec", "--user", "0"))
     assert "chown -h" in " ".join(chown)
-    assert chown[-6:] == (
+    assert chown[-11:] == (
         "/home/dev/.claude", "/home/dev/.copilot",
+        "/home/dev/.local", "/home/dev/.local/share", "/home/dev/.local/share/opencode",
+        "/home/dev/.config", "/home/dev/.config/opencode",
         "/home/dev/.cache", "/home/dev/.cache/pre-commit",
         f"{configured}/.venv", f"{configured}/node_modules",
     )  # fmt: skip

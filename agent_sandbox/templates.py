@@ -9,7 +9,7 @@ CONFIG_TOML = """\
 # Command lines tried in order by a plain `agent-sandbox`: the first one installed in the
 # container is started (a shell if none is). A single string works too. Each person can put
 # their preferred harnesses first in the user configuration (see `agent-sandbox help config`).
-harness = ["claude", "copilot", "bash", "sh"]
+harness = ["claude", "copilot", "opencode", "bash", "sh"]
 
 image = "{image}"
 
@@ -44,7 +44,7 @@ isolated = [".venv", "node_modules"]
 
 [state]
 # Directories below the container user's home that survive `rm` and `recreate`.
-paths = [".claude", ".copilot", ".cache/pre-commit"]
+paths = [".claude", ".copilot", ".local/share/opencode", ".config/opencode", ".cache/pre-commit"]
 
 # Extra read-only bind mounts. The source must exist and must not contain unix sockets.
 # `~` in source is your home directory; `~` in target is the container user's home.
@@ -106,6 +106,12 @@ api.github.com
 #   copilot-telemetry.githubusercontent.com
 #   collector.github.com
 #   default.exp-tas.com
+
+# OpenCode
+opencode.ai
+models.opencode.ai
+# Also needed for installation of OpenCode and its plugins (enable in allow.extra):
+#   registry.npmjs.org
 """
 
 ALLOW_EXTRA = """\

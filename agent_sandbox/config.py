@@ -22,9 +22,15 @@ DEVCONTAINER_DIR = ".devcontainer"
 DEFAULT_DEVCONTAINER_CONFIG = f"{DEVCONTAINER_DIR}/devcontainer.json"
 DEFAULT_DEVCONTAINER_CLI = ("devcontainer",)
 
-DEFAULT_HARNESS = ("claude", "copilot", "bash", "sh")
+DEFAULT_HARNESS = ("claude", "copilot", "opencode", "bash", "sh")
 DEFAULT_ENV_PASS = ("TERM", "COLORTERM", "LANG", "LC_ALL", "TZ")
-DEFAULT_STATE_PATHS = (".claude", ".copilot", ".cache/pre-commit")
+DEFAULT_STATE_PATHS = (
+    ".claude",
+    ".copilot",
+    ".local/share/opencode",
+    ".config/opencode",
+    ".cache/pre-commit",
+)
 DEFAULT_PROTECTED = (".claude", ".agents", ".vscode", ".idea", ".devcontainer")
 DEFAULT_ISOLATED = (".venv", "node_modules")
 DEFAULT_SECRETS = (".env", ".env.*", "*.env")

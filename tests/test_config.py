@@ -20,7 +20,7 @@ from agent_sandbox.util import SandboxError
 def test_minimal_project_config_gets_defaults() -> None:
     cfg = parse_project_config({"image": " ubuntu:24.04 "})
     assert cfg.image == "ubuntu:24.04"
-    assert cfg.harness == [["claude"], ["copilot"], ["bash"], ["sh"]]
+    assert cfg.harness == [["claude"], ["copilot"], ["opencode"], ["bash"], ["sh"]]
     assert cfg.env_pass == list(DEFAULT_ENV_PASS)
     assert cfg.env_set == {}
     assert cfg.mounts == []
@@ -191,7 +191,7 @@ def test_init_template_parses_and_escapes() -> None:
     assert cfg.env_set["CLAUDE_CONFIG_DIR"] == "{home}/.claude"
     assert cfg.state_paths == list(DEFAULT_STATE_PATHS)
     assert cfg.mounts == []
-    assert cfg.harness == [["claude"], ["copilot"], ["bash"], ["sh"]]
+    assert cfg.harness == [["claude"], ["copilot"], ["opencode"], ["bash"], ["sh"]]
 
 
 def test_load_project_config(repo: Path) -> None:
