@@ -26,7 +26,7 @@ pass = ["TERM", "COLORTERM", "LANG", "LC_ALL", "TZ"]
 [env.set]
 # `{{home}}` expands to the container user's home directory.
 CLAUDE_CONFIG_DIR = "{{home}}/.claude"
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 
 [workspace]
 # Read-only inside the sandbox: configuration that tools on the host execute or trust.
