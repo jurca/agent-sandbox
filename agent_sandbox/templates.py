@@ -26,6 +26,7 @@ pass = ["TERM", "COLORTERM", "LANG", "LC_ALL", "TZ"]
 [env.set]
 # `{{home}}` expands to the container user's home directory.
 CLAUDE_CONFIG_DIR = "{{home}}/.claude"
+# Warning: enabling this disables automatic updates for Claude code.
 # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 
 [workspace]
@@ -91,8 +92,8 @@ ALLOW_BASE = """\
 api.anthropic.com
 claude.ai
 platform.claude.com
+downloads.claude.ai
 # Optional:
-#   downloads.claude.ai       updates and plugin downloads
 #   mcp-proxy.anthropic.com   claude.ai MCP connectors
 #   registry.npmjs.org        plugin installs
 
