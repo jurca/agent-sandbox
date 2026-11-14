@@ -142,6 +142,10 @@ Everything carries labels (`agent-sandbox.managed/role/id/workspace/version/spec
 - `root`: `exec --user 0` with a prominent banner (setup only; do not run harnesses; root in a
   rootless engine equals the host user on the mounts, in a rootful engine it can create root/setuid
   files in the workspace). Starting a harness as root cannot be prevented, only discouraged.
+  Under a rootful engine `doctor` scans the trees the sandbox can write (bounded, like the socket
+  scan; it works on a stopped sandbox too): setuid/setgid regular files fail (they run as their
+  owner on the host), root-owned paths warn. Setgid directories are no finding (shared project
+  directories use them), and nothing is changed automatically: the user decides what to keep.
 
 ### Ownership by engine
 

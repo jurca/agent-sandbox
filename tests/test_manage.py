@@ -282,3 +282,54 @@ def test_offer_ignore_rules_is_quiet_when_covered(
     monkeypatch.setattr(manage, "confirm", lambda *a, **k: pytest.fail("asked"))
     manage.offer_ignore_rules(project_for(repo))
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("root_owned", "set_id", "levels"),
+    [
+        ([], [], ["ok"]),
+        (["build"], [], ["warn"]),
+        (["tools-sh"], ["tools-sh"], ["FAIL", "warn"]),
+    ],
+)
+def test_root_file_findings(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_owned: list[str],
+    set_id: list[str],
+    levels: list[str],
+) -> None:
+    from agent_sandbox.mounts import RootFileScan
+
+    from .test_sandbox import make_ctx
+
+    ctx = make_ctx(repo, FakeEngine("docker", rootless=False))
+    trees: list[tuple[Path, tuple[str, ...]]] = []
+
+    def scan(tree: Path, skip: tuple[str, ...]) -> RootFileScan:
+        trees.append((tree, skip))
+        return RootFileScan([repo / p for p in root_owned], [repo / p for p in set_id])
+
+    monkeypatch.setattr(manage, "scan_for_root_files", scan)
+    findings = manage.root_file_findings(ctx)
+    assert [level for level, _ in findings] == levels
+    assert trees == [
+        (repo, (".git", ".agent-sandbox", *ctx.config.protected, *ctx.config.isolated))
+    ]
+    if set_id:
+        assert "setuid/setgid file(s) in the workspace: tools-sh." in findings[0][1]
+        assert f"sudo chown -R {ctx.username}: PATH" in findings[1][1]
+
+
+def test_root_file_findings_note_an_incomplete_scan(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_sandbox.mounts import RootFileScan
+
+    from .test_sandbox import make_ctx
+
+    ctx = make_ctx(repo, FakeEngine("docker", rootless=False))
+    scan = RootFileScan(complete=False, entries=50_000)
+    monkeypatch.setattr(manage, "scan_for_root_files", lambda tree, skip: scan)
+    findings = manage.root_file_findings(ctx)
+    assert findings[0] == ("note", f"the scan of {repo} stopped after 50000 entries")

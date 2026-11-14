@@ -293,3 +293,25 @@ def test_foreign_paths(tmp_path: Path) -> None:
     # Symlinks are never listed (nor followed); unreadable directories are, without contents.
     assert sorted(listed) == expected
     assert sorted(by_group) == sorted(listed)
+
+
+def test_scan_for_root_files(tmp_path: Path) -> None:
+    (tmp_path / "skip" / "deep").mkdir(parents=True)
+    (tmp_path / "skip" / "deep" / "suid").write_text("x")
+    (tmp_path / "skip" / "deep" / "suid").chmod(0o4755)
+    (tmp_path / "bin").mkdir()
+    for name, mode in (("suid", 0o4755), ("sgid", 0o2755), ("plain", 0o755)):
+        (tmp_path / "bin" / name).write_text("x")
+        (tmp_path / "bin" / name).chmod(mode)
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "shared").chmod(0o2775)  # a setgid directory is not a finding
+    (tmp_path / "link").symlink_to("/usr/bin/passwd")  # not followed (setuid on most hosts)
+    found = mounts.scan_for_root_files(tmp_path, ["skip"])
+    assert sorted(found.set_id) == [tmp_path / "bin" / "sgid", tmp_path / "bin" / "suid"]
+    assert found.root_owned == [] and found.complete
+    # As if root owned them (a non-root test cannot create root-owned files).
+    mine = mounts.scan_for_root_files(tmp_path, ["skip"], owner=os.getuid())
+    assert sorted(mine.root_owned) == sorted(
+        [tmp_path / p for p in ("bin", "bin/suid", "bin/sgid", "bin/plain", "shared")]
+    )
+    assert not mounts.scan_for_root_files(tmp_path, max_entries=3).complete

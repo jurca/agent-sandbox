@@ -506,6 +506,22 @@ def test_repair_reclaims_files_the_host_cannot_change(env: Env, workspace: Path)
     shutil.rmtree(base)
 
 
+@pytest.mark.rootful_only
+def test_doctor_reports_what_a_root_shell_left_in_the_workspace(env: Env, scratch: Path) -> None:
+    assert "ok    no root-owned or setuid/setgid files" in ok(env, scratch, "doctor").out
+    left = "mkdir -p build && touch build/out.o && cp /bin/sh tool && chmod 4755 tool && umask"
+    ok(env, scratch, "root", stdin=left + "\n")
+    try:
+        doctor = asb(env, scratch, "doctor")
+        assert doctor.code == 1
+        assert "FAIL  setuid/setgid file(s) in the workspace: tool." in doctor.out
+        assert "warn  root-owned path(s) in the workspace (from a root shell?):" in doctor.out
+        assert all(name in doctor.out for name in ("build", "build/out.o", "tool"))
+    finally:
+        ok(env, scratch, "root", stdin="rm -rf build tool\n")  # root-owned: only root can
+    assert "ok    no root-owned or setuid/setgid files" in ok(env, scratch, "doctor").out
+
+
 def test_harness_fallback_and_root_banner(env: Env, workspace: Path) -> None:
     config = workspace / ".agent-sandbox" / "config.toml"
     original = config.read_text()

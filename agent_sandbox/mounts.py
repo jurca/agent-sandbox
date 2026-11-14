@@ -174,6 +174,60 @@ def scan_for_sockets(
     return result
 
 
+@dataclass
+class RootFileScan:
+    root_owned: list[Path] = field(default_factory=list)  # directories and files, not symlinks
+    set_id: list[Path] = field(default_factory=list)  # regular files with setuid or setgid
+    complete: bool = True
+    entries: int = 0
+
+
+def scan_for_root_files(
+    root: Path,
+    exclude: Iterable[str] = (),
+    *,
+    owner: int = 0,
+    max_entries: int = SCAN_MAX_ENTRIES,
+    max_seconds: float = SCAN_MAX_SECONDS,
+) -> RootFileScan:
+    """Paths below `root` (minus `exclude`, relative to it) owned by `owner` (root), and regular
+    files with setuid/setgid, within a budget; symlinks are not followed. Setgid directories are
+    left out: shared project directories use them to keep their group."""
+    skipped = frozenset(exclude)
+    result = RootFileScan()
+    deadline = time.monotonic() + max_seconds
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    result.entries += 1
+                    if result.entries >= max_entries or (
+                        result.entries % 256 == 0 and time.monotonic() > deadline
+                    ):
+                        result.complete = False
+                        return result
+                    path = Path(entry.path)
+                    if path.relative_to(root).as_posix() in skipped:
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    if info.st_uid == owner:
+                        result.root_owned.append(path)
+                    if stat.S_ISREG(info.st_mode) and info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                        result.set_id.append(path)
+                    elif stat.S_ISDIR(info.st_mode):
+                        stack.append(path)
+        except OSError:
+            continue
+    return result
+
+
 SOCKET_RISK = (
     "Unix sockets inside a mounted directory stay connectable from the sandbox even when the "
     "mount is read-only. A socket can be an SSH agent, a docker or desktop session, an IDE or "

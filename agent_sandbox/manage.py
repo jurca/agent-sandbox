@@ -23,7 +23,7 @@ from .config import (
 )
 from .engine import Engine, probe_engines
 from .images import host_uid_for, parse_uid_map
-from .mounts import has_workspace_acl
+from .mounts import has_workspace_acl, scan_for_root_files
 from .net import owner_alive
 from .project import (
     LABEL_HOME,
@@ -46,6 +46,7 @@ from .sandbox import (
     remove_by_id,
     reset_volume_ownership,
     share_workspace,
+    shared_trees,
     spec_hash,
 )
 from .util import SandboxError, confirm, eprint, format_duration, is_tty, state_dir
@@ -375,6 +376,46 @@ def lsm_confinement(label: str, modules: set[str], *, rootless: bool) -> tuple[s
     return "FAIL", f"the engine has {available}, but the sandbox is not confined by it ({seen})"
 
 
+def _some(paths: list[Path], root: Path, limit: int = 5) -> str:
+    shown = ", ".join(str(path.relative_to(root)) for path in paths[:limit])
+    return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
+
+
+def root_file_findings(ctx: Context) -> list[tuple[str, str]]:
+    """(level, text) for what a root shell can leave in the workspace under a rootful engine:
+    setuid/setgid files (FAIL: they run as their owner on the host) and root-owned paths
+    (warn: you cannot change them without sudo). The trees the sandbox can write, bounded."""
+    root = ctx.project.root
+    try:
+        plan = make_plan(ctx, container_home(ctx))
+    except SandboxError as exc:
+        return [("warn", f"cannot check the workspace for root-owned files: {exc}")]
+    root_owned: list[Path] = []
+    set_id: list[Path] = []
+    findings: list[tuple[str, str]] = []
+    for tree, skip in shared_trees(ctx, plan):
+        scan = scan_for_root_files(tree, skip)
+        root_owned += scan.root_owned
+        set_id += scan.set_id
+        if not scan.complete:
+            findings.append(("note", f"the scan of {tree} stopped after {scan.entries} entries"))
+    if set_id:
+        findings.append((
+            "FAIL",
+            f"setuid/setgid file(s) in the workspace: {_some(set_id, root)}. Run on the host, they "
+            "run as their owner; check them, then `chmod u-s,g-s` or delete them",
+        ))  # fmt: skip
+    if root_owned:
+        findings.append((
+            "warn",
+            f"root-owned path(s) in the workspace (from a root shell?): {_some(root_owned, root)}."
+            f" Check them, then `sudo chown -R {ctx.username}: PATH`",
+        ))  # fmt: skip
+    if not set_id and not root_owned:
+        findings.append(("ok", "no root-owned or setuid/setgid files in the workspace"))
+    return findings
+
+
 def doctor(ctx: Context) -> int:
     engine, project = ctx.engine, ctx.project
     problems = 0
@@ -390,6 +431,12 @@ def doctor(ctx: Context) -> int:
         from .mounts import acl_tools_available
 
         report(acl_tools_available(), "setfacl is installed (needed to share the workspace)")
+    if not engine.rootless:  # rootless: root in the sandbox is you on the host
+        for level, text in root_file_findings(ctx):
+            if level == "note":
+                print(f"note  {text}")
+            else:
+                report(level == "ok", text, warn=level == "warn")
     if engine.container_status(project.workspace_container) != "running":
         print("note  sandbox is not running; start it with `agent-sandbox` for the live checks")
         return 1 if problems else 0

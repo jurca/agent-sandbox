@@ -249,8 +249,9 @@ SECURITY NOTES
 - The proxy container runs as `nobody` with no capabilities and no host mounts; its
   configuration is copied in, so a compromised proxy owns nothing on the host.
 - `agent-sandbox root` is for setup. In a rootless engine root is your own host user on every
-  mount; in a rootful engine it can create root-owned and setuid files in the workspace.
-  Do not start a harness from a root shell; that cannot be prevented, only discouraged.
+  mount; in a rootful engine it can create root-owned and setuid files in the workspace
+  (`agent-sandbox doctor` lists them). Do not start a harness from a root shell; that cannot
+  be prevented, only discouraged.
 - Review agent changes on the host: `.git` and the protected paths are read-only in the
   container, but files the agent wrote (scripts, Makefiles, .envrc) are yours to inspect
   before you run them. Gitignored files do not show up in `git diff`; that is why
