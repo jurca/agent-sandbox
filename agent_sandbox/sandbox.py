@@ -8,6 +8,7 @@ import grp
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from collections.abc import Generator
@@ -181,6 +182,104 @@ def make_plan(ctx: Context, home: str | None = None) -> Plan:
         for rel in ctx.config.isolated
     ]
     return Plan(layout, mounts, volumes, isolated, ownership_mode(ctx.engine))
+
+
+# --- mounts that the host can take away ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NestedMount:
+    target: str
+    kind: str  # "read-only", "bind", "isolated" or "state"
+
+
+NESTED_CONSEQUENCES = {
+    "read-only": "read-only mount lost: writable from the sandbox now",
+    "bind": "mount lost: the sandbox sees what the host put there",
+    "isolated": "isolated volume lost: the sandbox shares the host's copy now",
+    "state": "state volume lost: harness state goes to the host's directory now",
+}
+
+
+def nested_mounts(ctx: Context, plan: Plan, home: str) -> list[NestedMount]:
+    """Planned mounts whose mount point lies inside a bind mount.
+
+    Their mount points are host paths. When the host removes, renames or replaces one (`rm -rf
+    .venv`, an editor saving a file by renaming over it) while the container runs, the kernel
+    detaches the mount in the container (or moves it along with a rename), and the container
+    sees the host's path underneath until the next start.
+    """
+    binds = [PurePosixPath(m.target) for m in plan.mounts]
+
+    def nested(target: str) -> bool:
+        path = PurePosixPath(target)
+        return any(parent in path.parents for parent in binds)
+
+    found = [
+        NestedMount(m.target, "read-only" if m.readonly else "bind")
+        for m in plan.mounts
+        if nested(m.target)
+    ]
+    found += [NestedMount(target, "isolated") for _, target in plan.isolated if nested(target)]
+    found += [
+        NestedMount(target, "state")
+        for _, rel in plan.volumes
+        if nested(target := str(PurePosixPath(home) / rel))
+    ]
+    return found
+
+
+def mount_points(mountinfo: str) -> set[str]:
+    """The mount points listed in a /proc/PID/mountinfo, unescaped (`\\040` is a space)."""
+    points = set()
+    for line in mountinfo.splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4:
+            points.add(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
+    return points
+
+
+def lost_mounts(ctx: Context, plan: Plan, home: str) -> list[NestedMount]:
+    """The nested mounts that the running workspace container no longer has."""
+    result = ctx.engine.run(
+        "exec", ctx.project.workspace_container, "cat", "/proc/self/mountinfo", check=False
+    )
+    points = mount_points(result.stdout)
+    if result.returncode != 0 or not points:
+        raise SandboxError(
+            "Could not read the mounts of the sandbox (`cat /proc/self/mountinfo` failed): "
+            f"{result.stderr.strip() or 'no output'}"
+        )
+    return [m for m in nested_mounts(ctx, plan, home) if m.target not in points]
+
+
+def describe_path(root: Path, target: str) -> str:
+    path = PurePosixPath(target)
+    return str(path.relative_to(root)) if PurePosixPath(root) in path.parents else target
+
+
+def lost_mounts_message(root: Path, lost: list[NestedMount]) -> str:
+    names = [describe_path(root, m.target) for m in lost]
+    width = max(len(name) for name in names)
+    lines = [
+        f"  {name:{width}}  {NESTED_CONSEQUENCES[m.kind]}"
+        for name, m in zip(names, lost, strict=True)
+    ]
+    return "\n".join([
+        "The host removed, renamed or replaced paths that the running sandbox mounts over, so the",
+        "kernel dropped those mounts inside the container:",
+        *lines,
+        "Sessions still running in the sandbox keep this access. Check what these paths hold",
+        "before you run or trust anything from them on the host.",
+        "Restarting the sandbox restores the mounts: `agent-sandbox stop` (this ends the running",
+        "sessions), then `agent-sandbox`. See `agent-sandbox help security`.",
+    ])  # fmt: skip
+
+
+def check_mounts(ctx: Context, plan: Plan, home: str) -> None:
+    lost = lost_mounts(ctx, plan, home)
+    if lost:
+        raise SandboxError(lost_mounts_message(ctx.project.root, lost))
 
 
 # --- the image ------------------------------------------------------------------------
@@ -711,7 +810,10 @@ def ensure_ready(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         if not engine.exists("network", project.network):
             raise SandboxError("The sandbox network is missing. Run `agent-sandbox recreate`.")
         state = (info.get("State") or {}).get("Status")
-        if state != "running":
+        if state == "running":
+            # A start mounts everything afresh; a running container may have lost some.
+            check_mounts(ctx, plan, labels.get(LABEL_HOME, f"/home/{ctx.username}"))
+        else:
             eprint("Starting the sandbox ...")
         ensure_proxy_container(ctx, ensure_proxy_image(engine, ctx.proxy_base_image))
         start_proxy(ctx)

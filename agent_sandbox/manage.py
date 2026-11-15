@@ -37,10 +37,13 @@ from .project import (
 )
 from .proxy import PROXY_UID
 from .sandbox import (
+    NESTED_CONSEQUENCES,
     Context,
     base_ref,
     compute_spec,
     container_home,
+    describe_path,
+    lost_mounts,
     make_plan,
     reclaim_workspace,
     remove_by_id,
@@ -283,9 +286,29 @@ def status(ctx: Context) -> None:
         except SandboxError as exc:
             drift = f"cannot be checked ({exc})"
         print(f"container:  {drift}")
+        if (info.get("State") or {}).get("Status") == "running":
+            print(f"mounts:     {mounts_state(ctx, labels.get(LABEL_HOME))[1]}")
         current = setup.session(ctx)
         done = setup.create_done(ctx, current, setup.plan_for(ctx, current))
         print(f"setup:      {'done' if done else 'pending (runs before the next harness start)'}")
+
+
+def mounts_state(ctx: Context, home: str | None) -> tuple[bool, str]:
+    """(intact, text) for the mounts the host can take from a running sandbox."""
+    home = home or f"/home/{ctx.username}"
+    try:
+        lost = lost_mounts(ctx, make_plan(ctx, home), home)
+    except SandboxError as exc:
+        return False, f"cannot be checked ({exc})"
+    if not lost:
+        return True, "all in place"
+    listed = "; ".join(
+        f"{describe_path(ctx.project.root, m.target)} ({NESTED_CONSEQUENCES[m.kind]})" for m in lost
+    )
+    return False, (
+        f"{len(lost)} LOST, replaced on the host while the sandbox ran: {listed}. "
+        "Check these paths, then restart: `agent-sandbox stop`, `agent-sandbox`"
+    )
 
 
 # --- doctor -----------------------------------------------------------------------------
@@ -441,6 +464,8 @@ def doctor(ctx: Context) -> int:
         print("note  sandbox is not running; start it with `agent-sandbox` for the live checks")
         return 1 if problems else 0
 
+    intact, text = mounts_state(ctx, container_home(ctx))
+    report(intact, f"mounts inside the workspace (git, protected, isolated): {text}")
     if engine.kind == "docker" and engine.rootless:
         result = engine.run(
             "exec", project.workspace_container, "cat", "/proc/self/uid_map", check=False

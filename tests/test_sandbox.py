@@ -973,3 +973,132 @@ def test_remote_env_is_resolved_from_the_container(configured: Path) -> None:
     assert sandbox.remote_env(ctx, current) == {"P": "/bin:/opt", "W": str(configured)}
     ctx.config.devcontainer, ctx.config.image = None, IMAGE
     assert sandbox.remote_env(ctx, current) == {}
+
+
+def mountinfo(*points: str) -> str:
+    return "".join(
+        f"{n} 1 0:1 / {p.replace(' ', chr(92) + '040')} rw - ext4 /dev/x rw\n"
+        for n, p in enumerate(points, 100)
+    )
+
+
+def test_nested_mounts_are_those_inside_a_bind_mount(configured: Path) -> None:
+    ctx = make_ctx(configured)
+    plan = make_plan(ctx)
+    nested = sandbox.nested_mounts(ctx, plan, "/home/dev")
+    ws = str(configured)
+    assert [(m.target, m.kind) for m in nested] == [
+        (f"{ws}/.git", "read-only"),
+        (f"{ws}/.agent-sandbox", "read-only"),
+        *((f"{ws}/{rel}", "read-only") for rel in DEFAULT_PROTECTED),
+        *((f"{ws}/{rel}", "isolated") for rel in DEFAULT_ISOLATED),
+    ]  # the workspace itself and the state volumes in the home directory are no host paths
+
+
+def test_nested_mounts_include_rw_git_and_state_under_an_extra_mount(
+    configured: Path, tmp_path: Path
+) -> None:
+    source = tmp_path / "share"
+    source.mkdir()
+    config = ProjectConfig(
+        image=IMAGE,
+        mounts=[MountSpec(str(source), "~/.local/share")],
+        state_paths=[".local/share/x"],
+    )
+    ctx = make_ctx(configured, config=config, user=UserConfig(git="rw"))
+    nested = sandbox.nested_mounts(ctx, make_plan(ctx, "/home/dev"), "/home/dev")
+    assert ("/home/dev/.local/share/x", "state") in [(m.target, m.kind) for m in nested]
+    assert (f"{configured}/.git", "bind") in [(m.target, m.kind) for m in nested]
+
+
+def test_mount_points_unescapes_mountinfo() -> None:
+    text = "36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw\nshort\n"
+    assert sandbox.mount_points(text) == {"/mnt/with space"}
+
+
+def running_sandbox(
+    configured: Path, engine: FakeEngine, monkeypatch: pytest.MonkeyPatch
+) -> Context:
+    """A running workspace container that matches the configuration."""
+    ctx = make_ctx(configured, engine)
+    spec = compute_spec(ctx, make_plan(ctx), "sha256:base")
+    engine.add("container", ctx.project.workspace_container, {
+        LABEL_WORKSPACE: str(configured),
+        LABEL_SPEC: spec_hash(spec),
+        LABEL_SPEC_JSON: json.dumps(spec),
+    }, State={"Status": "running"})  # fmt: skip
+    engine.add("network", ctx.project.network, {})
+    engine.on(("image", "inspect", "--format"), lambda args: "sha256:base")
+    monkeypatch.setattr(sandbox.approval, "ensure_approved", lambda project: None)
+    monkeypatch.setattr(sandbox, "ensure_proxy_image", lambda engine, base: "proxy")
+    monkeypatch.setattr(sandbox, "ensure_proxy_container", lambda ctx, image: False)
+    monkeypatch.setattr(sandbox, "start_proxy", lambda ctx: None)
+    return ctx
+
+
+def test_ensure_ready_refuses_when_the_host_took_mounts_away(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    ctx = running_sandbox(configured, engine, monkeypatch)
+    ws = str(configured)
+    plan = make_plan(ctx)
+    points = [*(m.target for m in plan.mounts), *(t for _, t in plan.isolated)]
+    kept = [p for p in points if p not in (f"{ws}/.venv", f"{ws}/.claude")]
+    engine.on(("exec", ctx.project.workspace_container, "cat"), lambda args: mountinfo(*kept))
+    with pytest.raises(SandboxError) as error:
+        sandbox.ensure_ready(ctx)
+    message = str(error.value)
+    assert "  .claude  read-only mount lost: writable from the sandbox now" in message
+    assert "  .venv    isolated volume lost: the sandbox shares the host's copy now" in message
+    assert "node_modules" not in message
+    assert "agent-sandbox stop" in message
+
+
+def test_ensure_ready_passes_when_all_mounts_are_in_place(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    ctx = running_sandbox(configured, engine, monkeypatch)
+    plan = make_plan(ctx)
+    points = [*(m.target for m in plan.mounts), *(t for _, t in plan.isolated)]
+    engine.on(("exec", ctx.project.workspace_container, "cat"), lambda args: mountinfo(*points))
+    sandbox.ensure_ready(ctx)
+    assert ("exec", ctx.project.workspace_container, "cat", "/proc/self/mountinfo") in engine.calls
+
+
+def test_ensure_ready_does_not_check_a_container_it_starts(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    ctx = running_sandbox(configured, engine, monkeypatch)
+    engine.objects[("container", ctx.project.workspace_container)]["State"] = {"Status": "exited"}
+    sandbox.ensure_ready(ctx)
+    assert not any(call[:1] == ("exec",) for call in engine.calls)
+    assert ("start", ctx.project.workspace_container) in engine.calls
+
+
+def test_ensure_ready_refuses_when_the_mounts_cannot_be_read(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    ctx = running_sandbox(configured, engine, monkeypatch)
+    engine.on(("exec", ctx.project.workspace_container, "cat"), lambda args: 1)
+    with pytest.raises(SandboxError, match="Could not read the mounts"):
+        sandbox.ensure_ready(ctx)
+
+
+def test_mounts_state_for_status_and_doctor(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = FakeEngine()
+    ctx = running_sandbox(configured, engine, monkeypatch)
+    plan = make_plan(ctx)
+    points = [m.target for m in plan.mounts]  # no isolated volumes
+    engine.on(("exec", ctx.project.workspace_container, "cat"), lambda args: mountinfo(*points))
+    intact, text = manage.mounts_state(ctx, "/home/dev")
+    assert not intact
+    assert text.startswith("2 LOST") and ".venv (isolated volume lost" in text
+    assert "node_modules (isolated volume lost" in text
+    points += [t for _, t in plan.isolated]
+    assert manage.mounts_state(ctx, "/home/dev") == (True, "all in place")

@@ -432,6 +432,7 @@ def test_status_and_doctor(env: Env, workspace: Path) -> None:
     status = ok(env, workspace, "status").out
     assert "approved" in status and "matches the configuration" in status
     assert "network:    base tier" in status
+    assert "mounts:     all in place" in status
     doctor = ok(env, workspace, "doctor").out
     assert "FAIL" not in doctor and "No problems found." in doctor
     for who in ("the sandbox user", "the proxy"):
@@ -754,6 +755,27 @@ def test_drift_requires_recreate(env: Env, scratch: Path) -> None:
         (scratch / ".git" / "rw-test").unlink(missing_ok=True)
     assert asb(env, scratch, "exec", "--", "true").code == 1
     ok(env, scratch, "recreate")
+
+
+def test_mounts_replaced_on_the_host_block_until_restart(env: Env, scratch: Path) -> None:
+    ok(env, scratch, "exec", "--", "true")
+    # What `poetry sync` does to a virtualenv: the kernel drops the volume mounted there.
+    shutil.rmtree(scratch / ".venv")
+    (scratch / ".venv").mkdir()
+    (scratch / ".venv" / "host-file").write_text("host\n")
+    shutil.rmtree(scratch / ".claude")
+    (scratch / ".claude").mkdir()
+    refused = asb(env, scratch, "exec", "--", "true")
+    assert refused.code == 1, refused.text
+    assert re.search(r"\.venv +isolated volume lost", refused.err), refused.err
+    assert re.search(r"\.claude +read-only mount lost", refused.err), refused.err
+    assert "node_modules" not in refused.err
+    assert "mounts:     2 LOST" in ok(env, scratch, "status").out
+    doctor = asb(env, scratch, "doctor")
+    assert doctor.code == 1 and "FAIL  mounts inside the workspace" in doctor.out, doctor.text
+    ok(env, scratch, "stop")
+    assert sh(env, scratch, "ls -A .venv; touch .claude/x 2>/dev/null || echo ro") == "ro\n"
+    assert "mounts:     all in place" in ok(env, scratch, "status").out
 
 
 def test_resource_limits_reach_the_cgroup(env: Env, scratch: Path) -> None:
