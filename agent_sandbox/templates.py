@@ -32,9 +32,13 @@ CLAUDE_CONFIG_DIR = "{{home}}/.claude"
 [workspace]
 # Read-only inside the sandbox: configuration that tools on the host execute or trust.
 # A missing path is created as an empty directory, so the agent cannot create it either.
+# A path the host itself removes, renames or replaces while the sandbox runs (an editor saving a
+# protected file does) stays unprotected until the sandbox restarts; this does not affect the
+# contents of protected directories, so prefer directories to files. See `help security`.
 protected = [".claude", ".agents", ".vscode", ".idea", ".devcontainer"]
 # Replaced by a volume of this workspace: the sandbox builds its own copy (virtualenv,
-# node_modules) and never writes the one the host runs.
+# node_modules) and never writes the one the host runs. Recreating one on the host while the
+# sandbox runs (`poetry sync`, `uv sync`) shares the host's copy with it until it restarts.
 isolated = [".venv", "node_modules"]
 # Secret files (.env, .env.*, *.env by default) may only be symlinks out of the workspace, ignored
 # by a committed .gitignore; `agent-sandbox secrets adopt` moves real ones. See `help security`.

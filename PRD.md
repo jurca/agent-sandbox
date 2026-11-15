@@ -245,6 +245,24 @@ network) is stored as a label with the full JSON. The container home used to exp
 is stored as a label too, so the check expands them the same way. On attach a mismatch aborts
 with the list of changed keys and tells the user to run `recreate`.
 
+### Mounts lost at runtime
+
+A mount whose mount point lies inside a bind mount (`.git`, `.agent-sandbox`, protected and
+isolated paths, a state or extra mount nested in an extra mount) has a host path as its mount
+point. When the host removes, renames or replaces that path while the container runs (`poetry
+sync` recreating `.venv`, an editor's tmp+rename save of a protected file), the kernel detaches
+the mount in the container's namespace (since Linux 3.18; a rename moves the mount along with the
+old name), and the container sees the host's path underneath until the next start: a protected
+path becomes writable, an isolated one is shared with the host. Verified on rootful and rootless
+docker. The contents of a protected directory are not affected; only the mount point itself.
+
+Attaching to a running container (`exec`, harness start, `root`, `setup`) reads its
+`/proc/self/mountinfo` and refuses when one of these mounts is missing, naming each path and what
+it lost and saying that a restart restores them; it also refuses when mountinfo cannot be read. A
+container that is started is not checked: the start mounts everything afresh. `status` prints
+`mounts:` for a running sandbox and `doctor` reports it as a check. Sessions that are already
+running are not interrupted and keep the access until the user restarts.
+
 ## 5. Network and proxy
 
 - Workspace container is only on the internal network. DNS for `proxy` comes from the engine.
@@ -481,8 +499,8 @@ others become the default (or empty) with a warning; anything else is left as is
 | `secrets check` | run the secret file checks (section 8) without starting anything; exit 1 on a finding |
 | `secrets adopt [--dry-run]` | move real secret files to the secrets directory and leave symlinks; never edits `.gitignore` |
 | `secrets rotated PATH...` | with the history check enabled: record that the secrets in the commits at these paths so far were rotated (section 8) |
-| `status` | state, approval, drift, proxy tier and time left |
-| `doctor` | live isolation checks (no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
+| `status` | state, approval, drift, mounts lost at runtime, proxy tier and time left |
+| `doctor` | live isolation checks (mounts lost at runtime, no direct route, proxy reachable, non-allowlisted host refused, no sockets, ACL) |
 | `repair` | reclaim workspace files owned by the sandbox user's sub-uid, re-apply ACLs and volume-root ownership, clear the deadline if no live `net` process owns it |
 | `help [config|network|security|COMMAND]` | built-in help is the single source of documentation |
 
@@ -608,7 +626,7 @@ secrets already committed, unless the history check finds them: the agent can re
   settings, lifecycle steps, `${...}` substitution), configuration checks and lockfile errors, the
   setup phases and their records, image layering and the spec, resource limits (merging, the CPU
   cap, limits the engine cannot enforce), the `/tmp` refusal, `doctor`'s security and root-owned
-  file checks.
+  file checks, which mounts the host can take away, mountinfo parsing and the refusal on attach.
 - Integration tests (marked `integration`, opt-in with `pytest --integration`, on rootless docker
   and on rootful docker with `AGENT_SANDBOX_ALLOW_ROOTFUL=1`; tests marked `rootless_only` or
   `rootful_only` skip on the other mode), using temp repos under `$ASB_TEST_DIR/asb-it-*`
@@ -628,7 +646,8 @@ secrets already committed, unless the history check finds them: the agent can re
   `upgrade`, build with a local Feature, lifecycle commands, `remoteEnv`, read-only
   `.devcontainer/`); `repair` not following symlinks in the container, the root shell's umask,
   `doctor`'s security checks, resource limits reaching the cgroup, a workspace under `/tmp`
-  refused; rootful only: `doctor` reporting the root-owned and setuid files a root shell left.
+  refused, `.venv` and `.claude` recreated on the host refusing attach until a restart; rootful
+  only: `doctor` reporting the root-owned and setuid files a root shell left.
 - Secret files, integration: a dangling link in the container; refusal on a real file, a link
   outside `secrets/`, a tracked file and an excludes-only rule; `adopt` then a clean start; the
   check on `exec` against a running sandbox; the history check off by default, refusing a match
@@ -706,15 +725,22 @@ secrets already committed, unless the history check finds them: the agent can re
   (a rename away moves it with the old name), new files are never masked, and on a symlink the
   engine follows the link and mounts over the target path, leaving `.env` unprotected when the link
   is replaced. With real files refused at every start, a mask would have nothing left to cover.
+- **Stopping the container when a mount is lost** (a watchdog as its main process): rejected.
+  It would end running sessions and lose unsaved work (a half-written prompt) without the user
+  choosing to; a poll loop also leaves a window. Refusing the next attach lets the user decide
+  when to restart. Making the host path undeletable needs root (`chattr +i`), and remounting from
+  inside needs `CAP_SYS_ADMIN`.
 - **Per-pattern FUSE filter over the workspace**: rejected. It is the only option that closes the
   mid-session gap, but needs a third-party dependency and a daemon, slows every workspace access and
   conflicts with the standard-library-only rule.
 
 ## 12. Deferred / out of scope for v1
 
-Podman verification; Squid as an alternative proxy (documented option if IP-level enforcement is
-ever required); user-level `[[mounts]]` (personal mounts such as `~/.agents/skills` currently live
-in the committed project config); resolving symlinks inside mounted skill directories (links
+Podman verification; restoring a lost mount without a restart (`open_tree`/`move_mount` into the
+running container's mount namespace from the host, awkward under rootless engines); Squid as an
+alternative proxy (documented option if IP-level enforcement is ever required); user-level
+`[[mounts]]` (personal mounts such as `~/.agents/skills` currently live in the committed project
+config); resolving symlinks inside mounted skill directories (links
 pointing outside the mount dangle in the container); a host-side watcher stopping the container
 when a real secret file appears mid-session (needs a process that outlives `exec`, which today
 replaces the launcher, and still leaves a short window); a user-level secrets directory other than

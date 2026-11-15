@@ -114,6 +114,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
   [workspace] isolated
                    workspace paths replaced by a per-workspace volume, so the sandbox keeps
                    its own copy (default: .venv node_modules)
+                   A protected or isolated path that the host replaces while the sandbox runs
+                   loses its mount until a restart (see `help security`).
   [workspace] secrets
                    file names that may only be symlinks out of the workspace, on top of the
                    defaults .env .env.* *.env (see `help security`)
@@ -274,6 +276,17 @@ SECURITY NOTES
   (setfacl) naming both you and the sandbox user. Podman uses --userns=keep-id. Rootful engines
   need `allow_rootful = true`. If you cannot write a file the sandbox created or changed, run
   `agent-sandbox repair`: it gives sandbox-owned files back to you and re-applies the ACLs.
+- Known limitation: a protected or isolated path that the host itself removes, renames or
+  replaces while the sandbox runs loses its protection until the sandbox restarts. The kernel
+  drops a mount when its mount point goes away in another mount namespace (a rename moves the
+  mount along), and the sandbox then sees the host's path: a protected one is writable, an
+  isolated one is shared with the host. Common causes: `poetry sync` or `uv sync` recreating
+  .venv, `rm -rf node_modules`, an editor saving a protected file by renaming a new copy over it.
+  This does not affect the contents of protected directories: files created, changed or replaced
+  inside one stay read-only, so protect a directory rather than a single file where you can.
+  The next `exec`, harness start, `root` or `setup` refuses and lists the lost mounts, and
+  `status` and `doctor` report them; sessions already running keep the access. Check those paths
+  before you run anything from them on the host, then `agent-sandbox stop` and start again.
 - Directories you mount may not contain unix sockets: a read-only mount still lets the
   sandbox connect to them. Override with the long flag only if you know what they are.
   `check_sockets = false` on a [[mounts]] entry skips the check for that mount.

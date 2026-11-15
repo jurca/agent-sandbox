@@ -18,6 +18,11 @@ Network access is closed by default for the same reason: agents, like people, ca
 (prompt injection), so the sandbox limits what a manipulated agent can reach instead of trusting it
 to resist. See `agent-sandbox help security`.
 
+A protected or isolated path (`.claude`, `.venv`, ...) that the host itself removes, renames or
+replaces while the sandbox runs, as `poetry sync` does with `.venv`, loses its protection until the
+sandbox restarts: the kernel drops the mount in the container. Starting a harness or running `exec`
+then refuses and names the paths; sessions already running keep the access until the restart.
+
 ## Requirements
 
 - Linux, Python 3.12+ (standard library only)
