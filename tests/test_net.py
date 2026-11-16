@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -8,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_sandbox import approval, manage, net, proxyctl
-from agent_sandbox.net import LogTail, Observed, render_bar
+from agent_sandbox.net import LogTail, Observed, render_bar, set_title
 from agent_sandbox.project import project_for
 from agent_sandbox.proxy import LogEvent
 from agent_sandbox.util import SandboxError
@@ -23,6 +25,26 @@ def test_render_bar() -> None:
     assert render_bar(0, 10, width=4) == "[░░░░]"
     assert render_bar(20, 10, width=4) == "[████]"
     assert render_bar(1, 0, width=2) == "[░░]"
+
+
+def test_set_title() -> None:
+    assert set_title("agent-sandbox net - 04:59 remaining") == (
+        "\x1b]2;agent-sandbox net - 04:59 remaining\x07"
+    )
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs Linux /proc")
+def test_process_name_rewrites_and_restores_the_command_line() -> None:
+    cmdline = Path("/proc/self/cmdline")
+    before = cmdline.read_bytes()
+    name = net.ProcessName()
+    assert name.area is not None
+    name.set("agent-sandbox net - 04:59 remaining")
+    argv0 = cmdline.read_bytes().split(b"\0")[0].decode()  # cut short if pytest's was shorter
+    assert argv0
+    assert "agent-sandbox\u00a0net\u00a0-\u00a004:59\u00a0remaining".startswith(argv0)
+    name.restore()
+    assert cmdline.read_bytes() == before
 
 
 def test_log_tail_parses_process_output() -> None:
@@ -215,3 +237,36 @@ def test_stop_net(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     net.stop_net(ctx)
     assert proxyctl.read_deadline(ctx.project) is None
+
+
+class _TtyStderr(io.StringIO):
+    encoding = "utf-8"
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_watch_shows_the_time_left_in_the_terminal_title(
+    configured: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = running_ctx(configured)
+    stderr = _TtyStderr()
+    interrupts = [KeyboardInterrupt()]
+
+    def sleep(seconds: float) -> None:  # Ctrl-C arrives once, during the countdown
+        if interrupts:
+            raise interrupts.pop()
+
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr(net, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(net, "LogTail", _QuietLog)
+    monkeypatch.setattr(proxyctl, "follow_log", lambda engine, project, since: None)
+    monkeypatch.setattr(proxyctl, "read_deadline", lambda project: time.time() + 299.5)
+    monkeypatch.setattr(proxyctl, "wait_for_state", lambda engine, project, wanted: True)
+    monkeypatch.setattr(net, "offer_promotion", lambda ctx, observed: None)
+    monkeypatch.setattr(time, "sleep", sleep)
+    net._watch(ctx, [], net.NetSession(), total=300, since=time.time())
+    out = stderr.getvalue()
+    title = set_title("agent-sandbox net - 05:00 remaining")
+    assert net.TITLE_PUSH in out
+    assert out.index(net.TITLE_PUSH) < out.index(title) < out.index(net.TITLE_POP)

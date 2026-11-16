@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import queue
@@ -36,6 +37,10 @@ SPINNER = "|/-\\"
 SETUP_LEASE = 300
 SETUP_RENEW = 60
 HOURGLASS = ("⏳", "⌛")
+# xterm control sequences: save the window title on the terminal's title stack, restore it.
+# Terminals without a title stack ignore these (and the shell's prompt usually resets it).
+TITLE_PUSH = "\x1b[22;0t"
+TITLE_POP = "\x1b[23;0t"
 
 
 @dataclass
@@ -48,6 +53,48 @@ def render_bar(remaining: float, total: float, width: int = 24) -> str:
     fraction = 0.0 if total <= 0 else max(0.0, min(1.0, remaining / total))
     filled = round(fraction * width)
     return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+def set_title(title: str) -> str:
+    """The control sequence that sets the terminal's window title (OSC 2)."""
+    return f"\x1b]2;{title}\x07"
+
+
+class ProcessName:
+    """Rewrites this process's command line, which is what some terminals show as the title.
+
+    VS Code names a terminal tab after the foreground process by default (`${process}`) and
+    ignores the title escape sequence; on Linux it reads argv[0] from /proc/<pid>/cmdline. Like
+    setproctitle, this overwrites the argv area in place: the name is cut to the original command
+    line's length. It does nothing where the area is unknown (not Linux, or hidden by /proc).
+    VS Code shows the name only up to the first space, so spaces become no-break spaces.
+    """
+
+    def __init__(self) -> None:
+        self.area = _argv_area()
+        self.original = ctypes.string_at(*self.area) if self.area else b""
+
+    def set(self, name: str) -> None:
+        if self.area:
+            start, size = self.area
+            # Keep the last byte NUL (argv stays one string) and cut between characters.
+            data = name.replace(" ", "\u00a0").encode()[: size - 1]
+            data = data.decode(errors="ignore").encode()
+            ctypes.memmove(start, data.ljust(size, b"\0"), size)
+
+    def restore(self) -> None:
+        if self.area:
+            ctypes.memmove(self.area[0], self.original, self.area[1])
+
+
+def _argv_area() -> tuple[int, int] | None:
+    """The (address, size) of this process's command line, per /proc/self/stat (Linux)."""
+    try:
+        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        start, end = int(fields[45]), int(fields[46])  # arg_start and arg_end (fields 48, 49)
+    except (OSError, IndexError, ValueError):
+        return None
+    return (start, end - start) if 0 < start < end else None
 
 
 class LogTail:
@@ -324,6 +371,10 @@ def _watch(
     eprint(f"Network access is on ({mode}). Press Ctrl-C to end it early.")
     last_plain = 0.0
     tick = 0
+    title = ""
+    name = ProcessName() if tty else None
+    if tty:
+        sys.stderr.write(TITLE_PUSH)
     # A cleared deadline means `net --stop` (or a restart of the sandbox) in another terminal.
     ending = "expired"
     try:
@@ -344,6 +395,12 @@ def _watch(
                 bar = render_bar(remaining, max(total, remaining))
                 line = f"{glyph} net {bar} {format_duration(remaining)} left  {mode}"
                 sys.stderr.write("\r\x1b[K" + line)
+                new_title = f"agent-sandbox net - {format_duration(remaining)} remaining"
+                if new_title != title:
+                    title = new_title
+                    sys.stderr.write(set_title(title))
+                    if name:
+                        name.set(title)
                 sys.stderr.flush()
             elif time.monotonic() - last_plain >= 30:
                 eprint(f"net: {format_duration(remaining)} left")
@@ -354,7 +411,10 @@ def _watch(
         ending = "interrupted"
     finally:
         if tty:
-            sys.stderr.write("\r\x1b[K")
+            sys.stderr.write("\r\x1b[K" + TITLE_POP)
+            sys.stderr.flush()
+        if name:
+            name.restore()
         proxyctl.clear_deadline(ctx.engine, project)
         _pid_path(ctx).unlink(missing_ok=True)
         proxyctl.wait_for_state(ctx.engine, project, "base")
