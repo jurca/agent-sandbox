@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import approval, devcontainer, proxyctl, secretfiles
+from . import approval, devcontainer, harnesses, proxyctl, secretfiles
 from .config import (
     DEFAULT_PROXY_BASE_IMAGE,
     DOCKERFILE,
@@ -632,6 +632,7 @@ def create_sandbox(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         args += [image.ref, "infinity"]
         engine.run(*args)
         created.append(("container", project.workspace_container))
+        harnesses.add_helper(engine, project.workspace_container)
         engine.run("start", project.workspace_container)
         fix_state_ownership(ctx, image.home)
     except BaseException:
@@ -818,6 +819,9 @@ def ensure_ready(ctx: Context, *, unsafe_sockets: bool = False) -> None:
         ensure_proxy_container(ctx, ensure_proxy_image(engine, ctx.proxy_base_image))
         start_proxy(ctx)
         if state != "running":
+            # Again on every start: a container created before it existed gets it, and an
+            # older version is replaced.
+            harnesses.add_helper(engine, project.workspace_container)
             engine.run("start", project.workspace_container)
 
 
@@ -1053,7 +1057,8 @@ def _resolve_command(ctx: Context, command: list[str] | None, env: list[str]) ->
     eprint(
         f"No harness was found in the container (tried {names}).\n"
         f"Set `harness` in {PROJECT_DIR}/config.toml or in the user configuration (and install "
-        "it in the image or via `agent-sandbox root`). Starting a shell instead."
+        "it in the image or via `agent-sandbox root`). Starting a shell instead; "
+        f"`{harnesses.HELPER_NAME}` there installs one for you."
     )
     return SHELL_FALLBACK
 

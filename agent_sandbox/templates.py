@@ -108,7 +108,7 @@ api.github.com
 gh.io
 # Optional:
 #   raw.githubusercontent.com                 copilot installation
-#   release-assets.githubusercontent.com      copilot updates
+#   release-assets.githubusercontent.com      copilot installation & updates
 #   copilot-proxy.githubusercontent.com
 #   origin-tracker.githubusercontent.com
 #   copilot-telemetry.githubusercontent.com

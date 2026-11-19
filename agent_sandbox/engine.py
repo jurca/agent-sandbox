@@ -70,11 +70,18 @@ class Engine:
         return result
 
     def copy_in(
-        self, container: str, directory: str, files: Mapping[str, str], *, uid: int, gid: int
+        self,
+        container: str,
+        directory: str,
+        files: Mapping[str, str],
+        *,
+        uid: int,
+        gid: int,
+        mode: int = 0o600,
     ) -> None:
         """Write files into a (possibly stopped) container; owner and mode come from the tar."""
         cmd = [*self.base_cmd(), "cp", "-", f"{container}:{directory}"]
-        archive = tar_archive(files, uid=uid, gid=gid)
+        archive = tar_archive(files, uid=uid, gid=gid, mode=mode)
         result = subprocess.run(cmd, input=archive, capture_output=True, check=False)
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()

@@ -605,6 +605,12 @@ def test_create_arguments(configured: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert "--network" not in " ".join(
         next(c for c in engine.calls if c[:3] == ("create", "--name", ctx.project.proxy_container))
     )
+    container = ctx.project.workspace_container
+    helper = (container, "/usr/local/bin/install-harness")
+    assert engine.files[helper].startswith("#!/bin/sh") and engine.modes[helper] == 0o755
+    assert engine.calls.index(("cp", container, "install-harness")) < engine.calls.index(
+        ("start", container)
+    )
     chown = next(c for c in engine.calls if c[:3] == ("exec", "--user", "0"))
     assert "chown -h" in " ".join(chown)
     assert chown[-11:] == (
@@ -1075,7 +1081,11 @@ def test_ensure_ready_does_not_check_a_container_it_starts(
     engine.objects[("container", ctx.project.workspace_container)]["State"] = {"Status": "exited"}
     sandbox.ensure_ready(ctx)
     assert not any(call[:1] == ("exec",) for call in engine.calls)
-    assert ("start", ctx.project.workspace_container) in engine.calls
+    container = ctx.project.workspace_container
+    assert ("start", container) in engine.calls
+    # install-harness is (re)added before every start
+    helper = ("cp", container, "install-harness")
+    assert engine.calls.index(helper) < engine.calls.index(("start", container))
 
 
 def test_ensure_ready_refuses_when_the_mounts_cannot_be_read(

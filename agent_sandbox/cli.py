@@ -105,7 +105,8 @@ Everything else in {PROJECT_DIR}/ is approved as well (a Dockerfile may copy it)
                    picks another one than .devcontainer/devcontainer.json
   harness          command line, or list of them, started by a plain `agent-sandbox`: the
                    first one installed in the container (default: claude copilot opencode bash
-                   sh)
+                   sh). In the sandbox, `install-harness` installs Claude Code, Copilot CLI or
+                   OpenCode into the container (`recreate` removes it; the image keeps one)
   [env] pass       host variables to pass into the container (when set)
   [env.set]        fixed variables; {{home}} expands to the container home directory
   [workspace] protected

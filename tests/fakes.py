@@ -20,14 +20,23 @@ class FakeEngine(Engine):
         self.handlers: list[tuple[tuple[str, ...], Handler]] = []
         self.files: dict[tuple[str, str], str] = {}  # (container, path) -> content
         self.copies: list[tuple[str, list[str]]] = []  # (container, names) per copy_in
+        self.modes: dict[tuple[str, str], int] = {}  # (container, path) -> mode
 
     def copy_in(
-        self, container: str, directory: str, files: Mapping[str, str], *, uid: int, gid: int
+        self,
+        container: str,
+        directory: str,
+        files: Mapping[str, str],
+        *,
+        uid: int,
+        gid: int,
+        mode: int = 0o600,
     ) -> None:
         self.calls.append(("cp", container, *files))
         self.copies.append((container, list(files)))
         for name, text in files.items():
             self.files[(container, f"{directory}/{name}")] = text
+            self.modes[(container, f"{directory}/{name}")] = mode
 
     def on(self, prefix: tuple[str, ...], handler: Handler) -> None:
         self.handlers.append((prefix, handler))
