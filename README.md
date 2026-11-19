@@ -33,7 +33,15 @@ then refuses and names the paths; sessions already running keep the access until
 
 ## Install
 
-Either symlink the launcher into your `PATH`:
+```bash
+curl -fsSL https://raw.githubusercontent.com/jurca/agent-sandbox/main/install.sh | sh
+```
+
+clones the repository into `~/.agent-sandbox`, symlinks the launcher into `~/.local/bin` (adding it
+to `PATH` in `~/.bashrc` if needed), installs the devcontainers CLI if it is missing, checks the
+container engine and, for a rootful one, offers the `allow_rootful` opt-in. Run it again to update.
+
+Or, from a checkout, symlink the launcher into your `PATH`:
 
 ```bash
 ln -s "$PWD/agent-sandbox" ~/.local/bin/agent-sandbox
